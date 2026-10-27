@@ -5,12 +5,11 @@ const cors = require('cors');
 //ENVIRONMENT VARIABLES
 const path = require("path");
 
-const envResult = require("dotenv").config({
-    path: path.join(__dirname, ".env")
-});
-
-if (envResult.error) {
-    console.error("ENV LOAD ERROR:", envResult.error.message);
+// Load .env locally; Render uses environment variables from its dashboard.
+if (process.env.NODE_ENV !== "production") {
+    require("dotenv").config({
+        path: path.join(__dirname, ".env")
+    });
 }
 
 console.log(
