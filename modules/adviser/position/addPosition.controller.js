@@ -55,18 +55,22 @@ async function resolveElection(value) {
 }
 
 // Current election must not be completed or archived.
+
 function canEdit(election) {
-    return Boolean(
-        election &&
+    if (!election) return false;
+
+    const status = String(election.status || "")
+        .trim()
+        .toLowerCase();
+
+    return (
         Number(election.is_current) === 1 &&
+        Number(election.is_active) === 0 &&
         election.archived_at == null &&
-        election.status !== "completed"
+        status !== "active" &&
+        status !== "completed"
     );
 }
-
-// Lock the current election while modifying positions.
-// This helps prevent archive and position changes from
-// overlapping within a transaction.
 async function withCurrentElection(callback) {
     const db = await connection.getConnection();
 
@@ -74,7 +78,7 @@ async function withCurrentElection(callback) {
         await db.beginTransaction();
 
         const [rows] = await db.execute(
-            `SELECT election_id, status, is_current, archived_at
+            `SELECT election_id, status, is_active, is_current, archived_at
              FROM elections
              WHERE is_current = 1
                AND archived_at IS NULL
@@ -170,8 +174,6 @@ exports.addPosition = async (req, res) => {
         const result = await withCurrentElection(
             async (db, election) => {
 
-                // Older frontend requests can still send election_id.
-                // It must match the current election.
                 if (
                     election_id !== undefined &&
                     election_id !== null &&

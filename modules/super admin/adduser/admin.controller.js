@@ -1,8 +1,10 @@
+"use strict";
 
 const bcrypt = require("bcryptjs");
-const connection = require("../../../config/db");
+const db = require("../../../config/db");
+const { sendCredentialsEmail } = require("./resend.server");
 
-const ALLOWED_ROLES = ["committee", "adviser"];
+const ALLOWED_ROLES = ["adviser", "committee", "super_admin"];
 
 const clean = value =>
     typeof value === "string" ? value.trim() : "";
@@ -13,22 +15,31 @@ const validEmail = email =>
 const validId = id =>
     Number.isSafeInteger(Number(id)) && Number(id) > 0;
 
+function validatePassword(password) {
+    return typeof password === "string" &&
+        password.length >= 9 &&
+        Buffer.byteLength(password, "utf8") <= 72;
+}
+
 // CREATE ACCOUNT
 exports.createAccount = async (req, res) => {
     try {
-        const name = clean(req.body.name);
-        const email = clean(req.body.email).toLowerCase();
-        const password = req.body.password;
-        const role = clean(req.body.role).toLowerCase();
+        const name = clean(req.body?.name);
+        const email = clean(req.body?.email).toLowerCase();
+        const password = req.body?.password;
+        const role = clean(req.body?.role).toLowerCase();
 
-        if (!name || !email || !password || !role) {
+        if (!name || !email || !role || !password) {
             return res.status(400).json({
                 message: "Please complete all fields."
             });
         }
 
-        if (name.length > 100 || email.length > 150 ||
-            !validEmail(email)) {
+        if (
+            name.length > 100 ||
+            email.length > 150 ||
+            !validEmail(email)
+        ) {
             return res.status(400).json({
                 message: "Invalid name or email."
             });
@@ -40,15 +51,13 @@ exports.createAccount = async (req, res) => {
             });
         }
 
-        if (typeof password !== "string" ||
-            password.length < 6 ||
-            Buffer.byteLength(password, "utf8") > 72) {
+        if (!validatePassword(password)) {
             return res.status(400).json({
-                message: "Password must be at least 6 characters and no more than 72 bytes."
+                message: "Temporary password must be at least 9 characters and at most 72 UTF-8 bytes."
             });
         }
 
-        const [existing] = await connection.execute(
+        const [existing] = await db.execute(
             "SELECT id FROM users WHERE email = ? LIMIT 1",
             [email]
         );
@@ -59,17 +68,46 @@ exports.createAccount = async (req, res) => {
             });
         }
 
-        const hashed = await bcrypt.hash(password, 10);
+        const hash = await bcrypt.hash(password, 12);
 
-        const [result] = await connection.execute(
+        const [result] = await db.execute(
             `INSERT INTO users
-             (name, email, password, role)
-             VALUES (?, ?, ?, ?)`,
-            [name, email, hashed, role]
+             (name, email, password, role, must_change_password)
+             VALUES (?, ?, ?, ?, 1)`,
+            [name, email, hash, role]
         );
 
+        let emailSent = false;
+        let emailRedirected = false;
+        let emailError = null;
+
+        try {
+            const sent = await sendCredentialsEmail({
+                to: email,
+                firstName: name,
+                userName: email,
+                password,
+                role
+            });
+
+            emailSent = sent?.sent === true;
+            emailRedirected = sent?.redirected === true;
+
+            if (!emailSent) {
+                emailError = "Email service did not accept the message.";
+            }
+        } catch (error) {
+            emailError = error.message;
+            console.error("RESEND ERROR:", error);
+        }
+
         return res.status(201).json({
-            message: "Account created successfully.",
+            message: emailSent
+                ? "Account created. Email accepted by Resend."
+                : "Account created, but email sending failed.",
+            emailSent,
+            emailRedirected,
+            ...(emailError ? { emailError } : {}),
             user: {
                 id: result.insertId,
                 name,
@@ -80,26 +118,33 @@ exports.createAccount = async (req, res) => {
 
     } catch (error) {
         console.error("CREATE ACCOUNT ERROR:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(409).json({
+                message: "Email already exists."
+            });
+        }
+
         return res.status(500).json({
             message: "Unable to create account."
         });
     }
 };
 
-// GET ACCOUNT LIST
+// GET ACCOUNTS
 exports.getAccounts = async (req, res) => {
     try {
-        const [users] = await connection.execute(
+        const [users] = await db.execute(
             `SELECT id, name, email, role
              FROM users
-             WHERE role IN ('committee', 'adviser')
+             WHERE role IN ('adviser', 'committee', 'super_admin')
              ORDER BY id DESC`
         );
 
-        return res.status(200).json({ users });
-
+        return res.json({ users });
     } catch (error) {
         console.error("GET ACCOUNTS ERROR:", error);
+
         return res.status(500).json({
             message: "Unable to load accounts."
         });
@@ -110,10 +155,10 @@ exports.getAccounts = async (req, res) => {
 exports.updateAccount = async (req, res) => {
     try {
         const { id } = req.params;
-        const name = clean(req.body.name);
-        const email = clean(req.body.email).toLowerCase();
-        const role = clean(req.body.role).toLowerCase();
-        const password = req.body.password;
+        const name = clean(req.body?.name);
+        const email = clean(req.body?.email).toLowerCase();
+        const role = clean(req.body?.role).toLowerCase();
+        const password = req.body?.password;
 
         if (!validId(id)) {
             return res.status(400).json({
@@ -121,10 +166,14 @@ exports.updateAccount = async (req, res) => {
             });
         }
 
-        if (!name || !email || !role ||
+        if (
+            !name ||
+            !email ||
+            !role ||
             name.length > 100 ||
             email.length > 150 ||
-            !validEmail(email)) {
+            !validEmail(email)
+        ) {
             return res.status(400).json({
                 message: "Valid name, email and role are required."
             });
@@ -136,66 +185,72 @@ exports.updateAccount = async (req, res) => {
             });
         }
 
-        const [accounts] = await connection.execute(
+        // Super Admin accounts are protected from editing here.
+        const [accounts] = await db.execute(
             `SELECT id FROM users
              WHERE id = ?
-             AND role IN ('committee', 'adviser')
+             AND role IN ('adviser', 'committee')
              LIMIT 1`,
             [id]
         );
 
         if (!accounts.length) {
             return res.status(404).json({
-                message: "Account not found."
+                message: "Account not found or protected."
             });
         }
 
-        const [existing] = await connection.execute(
+        const [duplicate] = await db.execute(
             `SELECT id FROM users
              WHERE email = ? AND id <> ?
              LIMIT 1`,
             [email, id]
         );
 
-        if (existing.length) {
+        if (duplicate.length) {
             return res.status(409).json({
                 message: "Email already used by another account."
             });
         }
 
-        if (password !== undefined &&
+        if (
+            password !== undefined &&
             password !== null &&
-            password !== "") {
-
-            if (typeof password !== "string" ||
-                password.length < 6 ||
-                Buffer.byteLength(password, "utf8") > 72) {
+            password !== ""
+        ) {
+            if (!validatePassword(password)) {
                 return res.status(400).json({
-                    message: "New password must be at least 6 characters and no more than 72 bytes."
+                    message: "Temporary password must be at least 9 characters and at most 72 UTF-8 bytes."
                 });
             }
 
-            const hashed = await bcrypt.hash(password, 10);
+            const hash = await bcrypt.hash(password, 12);
 
-            await connection.execute(
+            await db.execute(
                 `UPDATE users
-                 SET name = ?, email = ?, role = ?, password = ?
+                 SET name = ?,
+                     email = ?,
+                     role = ?,
+                     password = ?,
+                     must_change_password = 1
                  WHERE id = ?
-                 AND role IN ('committee', 'adviser')`,
-                [name, email, role, hashed, id]
+                 AND role IN ('adviser', 'committee')`,
+                [name, email, role, hash, id]
             );
 
         } else {
-            await connection.execute(
+            await db.execute(
                 `UPDATE users
-                 SET name = ?, email = ?, role = ?
+                 SET name = ?,
+                     email = ?,
+                     role = ?
                  WHERE id = ?
-                 AND role IN ('committee', 'adviser')`,
+                 AND role IN ('adviser', 'committee')`,
                 [name, email, role, id]
             );
         }
 
-        return res.status(200).json({
+        return res.json({
             message: "Account updated successfully.",
             user: {
                 id: Number(id),
@@ -207,6 +262,13 @@ exports.updateAccount = async (req, res) => {
 
     } catch (error) {
         console.error("UPDATE ACCOUNT ERROR:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(409).json({
+                message: "Email already used by another account."
+            });
+        }
+
         return res.status(500).json({
             message: "Unable to update account."
         });
@@ -224,25 +286,27 @@ exports.deleteAccount = async (req, res) => {
             });
         }
 
-        const [result] = await connection.execute(
+        // Protect Super Admin accounts.
+        const [result] = await db.execute(
             `DELETE FROM users
              WHERE id = ?
-             AND role IN ('committee', 'adviser')`,
+             AND role IN ('adviser', 'committee')`,
             [id]
         );
 
         if (!result.affectedRows) {
             return res.status(404).json({
-                message: "Account not found."
+                message: "Account not found or protected."
             });
         }
 
-        return res.status(200).json({
+        return res.json({
             message: "Account deleted successfully."
         });
 
     } catch (error) {
         console.error("DELETE ACCOUNT ERROR:", error);
+
         return res.status(500).json({
             message: "Unable to delete account."
         });

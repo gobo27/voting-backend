@@ -1,4 +1,6 @@
 
+"use strict";
+
 const express = require("express");
 const router = express.Router();
 
@@ -48,6 +50,18 @@ router.post(
 router.post(
     "/:election_id/mask",
     electionControl.toggleMaskNames
+);
+
+// New: live counting status
+router.get(
+    "/:election_id/counting-status",
+    electionControl.getCountingStatus
+);
+
+// New: finish scanning and lock counting
+router.post(
+    "/:election_id/finish-scanning",
+    electionControl.finishScanning
 );
 
 module.exports = router;

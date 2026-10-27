@@ -1,3 +1,4 @@
+"use strict";
 
 const express = require("express");
 const router = express.Router();
@@ -5,20 +6,22 @@ const router = express.Router();
 const verifyToken = require("../../../modules/sheared/middleware");
 const controller = require("./electionArchive.controller");
 
-// Only Super Admin can access this module.
+// SUPER ADMIN ONLY
 router.use(
     verifyToken,
     verifyToken.requireRole("super_admin")
 );
 
-// View all election cycles
+// ELECTION HISTORY
 router.get("/", controller.list);
 
-// Archive completed election
+// VIEW RESULTS, BALLOTS AND CANDIDATES
+router.get("/:id/details", controller.details);
+
+// ARCHIVE ELECTION
 router.post("/:id/archive", controller.archive);
 
-// Create new election cycle
+// CREATE NEW ELECTION
 router.post("/", controller.create);
-
 
 module.exports = router;

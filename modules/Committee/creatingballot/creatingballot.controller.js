@@ -1,4 +1,6 @@
 
+"use strict";
+
 const connection = require("../../../config/db");
 
 // ================= HELPERS =================
@@ -59,11 +61,11 @@ function validateCoordinates(coordinates) {
     return null;
 }
 
-// All ballot write operations use the same election lock.
-// This also coordinates with the archive operation when
-// the archive controller uses the same named lock.
+// ================= ELECTION LOCK =================
+
 async function withCurrentElection(callback) {
     const db = await connection.getConnection();
+
     let locked = false;
     let transactionStarted = false;
 
@@ -72,7 +74,7 @@ async function withCurrentElection(callback) {
             "SELECT GET_LOCK('campusvote_election_cycle', 10) AS acquired"
         );
 
-        if (lockResult.acquired !== 1) {
+        if (Number(lockResult.acquired) !== 1) {
             return {
                 status: 503,
                 body: {
@@ -82,11 +84,18 @@ async function withCurrentElection(callback) {
         }
 
         locked = true;
+
         await db.beginTransaction();
         transactionStarted = true;
 
         const [rows] = await db.execute(
-            `SELECT election_id, status, is_current, archived_at
+            `SELECT
+                election_id,
+                status,
+                is_active,
+                scanning_open,
+                is_current,
+                archived_at
              FROM elections
              WHERE is_current = 1
                AND archived_at IS NULL
@@ -99,6 +108,7 @@ async function withCurrentElection(callback) {
         if (!election) {
             await db.rollback();
             transactionStarted = false;
+
             return {
                 status: 409,
                 body: {
@@ -107,14 +117,24 @@ async function withCurrentElection(callback) {
             };
         }
 
-        if (election.status === "completed") {
+        const completed =
+            String(election.status || "").toLowerCase() === "completed";
+
+        const votingActive =
+            Number(election.is_active) === 1;
+
+        const scanningActive =
+            Number(election.scanning_open) === 1;
+
+        if (completed || votingActive || scanningActive) {
             await db.rollback();
             transactionStarted = false;
+
             return {
                 status: 409,
                 body: {
                     message:
-                        "Cannot modify ballots in a completed election"
+                        "Cannot modify ballot templates while voting/scanning is active or the election is completed"
                 }
             };
         }
@@ -136,6 +156,7 @@ async function withCurrentElection(callback) {
                 await db.rollback();
             } catch (_) {}
         }
+
         throw error;
 
     } finally {
@@ -145,9 +166,13 @@ async function withCurrentElection(callback) {
                     "SELECT RELEASE_LOCK('campusvote_election_cycle')"
                 );
             } catch (error) {
-                console.error("Release election lock error:", error);
+                console.error(
+                    "Release election lock error:",
+                    error
+                );
             }
         }
+
         db.release();
     }
 }
@@ -157,7 +182,8 @@ function matchesCurrent(requestedId, election) {
         requestedId === "current" ||
         (
             validId(requestedId) &&
-            Number(requestedId) === election.election_id
+            Number(requestedId) ===
+                Number(election.election_id)
         )
     );
 }
@@ -169,7 +195,9 @@ async function candidatesBelongToElection(
 ) {
     if (!candidateIds.length) return false;
 
-    const placeholders = candidateIds.map(() => "?").join(",");
+    const placeholders = candidateIds
+        .map(() => "?")
+        .join(",");
 
     const [rows] = await db.execute(
         `SELECT c.candidate_id
@@ -209,7 +237,8 @@ exports.createTemplate = async (req, res) => {
         !validPaperSize(paper_size)
     ) {
         return res.status(400).json({
-            message: "Valid template_name and paper_size are required"
+            message:
+                "Valid template_name and paper_size are required"
         });
     }
 
@@ -274,17 +303,20 @@ exports.createCompleteTemplate = async (req, res) => {
     } = req.body || {};
 
     if (
-        (!validId(election_id) && election_id !== "current") ||
+        (!validId(election_id) &&
+            election_id !== "current") ||
         typeof template_name !== "string" ||
         !template_name.trim() ||
         !validPaperSize(paper_size)
     ) {
         return res.status(400).json({
-            message: "Invalid election, template name or paper size"
+            message:
+                "Invalid election, template name or paper size"
         });
     }
 
-    const validationError = validateCoordinates(coordinates);
+    const validationError =
+        validateCoordinates(coordinates);
 
     if (validationError) {
         return res.status(400).json({
@@ -326,6 +358,88 @@ exports.createCompleteTemplate = async (req, res) => {
                     };
                 }
 
+                // Prevent identical complete templates.
+                const [existingTemplates] = await db.execute(
+                    `SELECT template_id
+                     FROM ballot_templates
+                     WHERE election_id = ?
+                       AND template_name = ?
+                       AND paper_size = ?
+                     ORDER BY template_id ASC`,
+                    [
+                        election.election_id,
+                        template_name.trim(),
+                        paper_size
+                    ]
+                );
+
+                const incoming = coordinates.map(c =>
+                    [
+                        Number(c.candidate_id),
+                        c.bubble_code.trim(),
+                        c.x_pos,
+                        c.y_pos,
+                        c.width,
+                        c.height
+                    ].join("|")
+                ).sort();
+
+                for (const old of existingTemplates) {
+                    const [oldCoords] = await db.execute(
+                        `SELECT
+                            candidate_id,
+                            bubble_code,
+                            x_pos,
+                            y_pos,
+                            width,
+                            height
+                         FROM omr_grid_coordinates
+                         WHERE template_id = ?`,
+                        [old.template_id]
+                    );
+
+                    const previous = oldCoords.map(c =>
+                        [
+                            Number(c.candidate_id),
+                            c.bubble_code.trim(),
+                            c.x_pos,
+                            c.y_pos,
+                            c.width,
+                            c.height
+                        ].join("|")
+                    ).sort();
+
+                    const identical =
+                        previous.length === incoming.length &&
+                        previous.every(
+                            (value, index) =>
+                                value === incoming[index]
+                        );
+
+                    if (identical) {
+                        return {
+                            status: 200,
+                            body: {
+                                message:
+                                    "Identical ballot already saved",
+                                duplicate: true,
+                                template: {
+                                    template_id:
+                                        old.template_id,
+                                    election_id:
+                                        election.election_id,
+                                    template_name:
+                                        template_name.trim(),
+                                    paper_size
+                                },
+                                coordinates_saved:
+                                    previous.length
+                            }
+                        };
+                    }
+                }
+
+                // Create a new complete template.
                 const [insert] = await db.execute(
                     `INSERT INTO ballot_templates
                      (election_id, template_name, paper_size)
@@ -372,10 +486,12 @@ exports.createCompleteTemplate = async (req, res) => {
                         template: {
                             template_id: templateId,
                             election_id: election.election_id,
-                            template_name: template_name.trim(),
+                            template_name:
+                                template_name.trim(),
                             paper_size
                         },
-                        coordinates_saved: coordinates.length
+                        coordinates_saved:
+                            coordinates.length
                     }
                 };
             }
@@ -411,7 +527,9 @@ exports.addGridCoordinate = async (req, res) => {
         !validId(candidate_id) ||
         typeof bubble_code !== "string" ||
         !bubble_code.trim() ||
-        ![x_pos, y_pos, width, height].every(Number.isInteger) ||
+        ![x_pos, y_pos, width, height].every(
+            Number.isInteger
+        ) ||
         x_pos < 0 ||
         y_pos < 0 ||
         width <= 0 ||
@@ -443,8 +561,8 @@ exports.addGridCoordinate = async (req, res) => {
                 }
 
                 if (
-                    templates[0].election_id !==
-                    election.election_id
+                    Number(templates[0].election_id) !==
+                    Number(election.election_id)
                 ) {
                     return {
                         status: 403,
@@ -527,9 +645,12 @@ exports.addGridCoordinate = async (req, res) => {
                         message: "OMR coordinate added",
                         coordinate: {
                             coord_id: insert.insertId,
-                            template_id: Number(template_id),
-                            candidate_id: Number(candidate_id),
-                            bubble_code: bubble_code.trim(),
+                            template_id:
+                                Number(template_id),
+                            candidate_id:
+                                Number(candidate_id),
+                            bubble_code:
+                                bubble_code.trim(),
                             x_pos,
                             y_pos,
                             width,
@@ -553,7 +674,6 @@ exports.addGridCoordinate = async (req, res) => {
 
 // ================= GET ONE TEMPLATE =================
 
-// Historical templates remain readable.
 exports.getTemplate = async (req, res) => {
     const { template_id } = req.params;
 
@@ -625,7 +745,6 @@ exports.getTemplate = async (req, res) => {
 
 // ================= GET TEMPLATES BY ELECTION =================
 
-// Supports a numeric election ID or "current".
 exports.getTemplatesByElection = async (req, res) => {
     const { election_id } = req.params;
 
@@ -677,5 +796,193 @@ exports.getTemplatesByElection = async (req, res) => {
             "Get templates error:",
             error
         );
+    }
+};
+
+// ================= DELETE UNUSED TEMPLATE =================
+
+exports.deleteTemplate = async (req, res) => {
+    const templateId = Number(req.params.template_id);
+
+    if (
+        !Number.isSafeInteger(templateId) ||
+        templateId <= 0
+    ) {
+        return res.status(400).json({
+            message: "Invalid ballot template ID."
+        });
+    }
+
+    let db;
+    let transactionStarted = false;
+
+    try {
+        db = await connection.getConnection();
+
+        await db.beginTransaction();
+        transactionStarted = true;
+
+        // Check the selected template and lock its row.
+        const [templates] = await db.execute(
+            `SELECT
+                template_id,
+                election_id,
+                template_name
+             FROM ballot_templates
+             WHERE template_id = ?
+             LIMIT 1
+             FOR UPDATE`,
+            [templateId]
+        );
+
+        if (!templates.length) {
+            await db.rollback();
+            transactionStarted = false;
+
+            return res.status(404).json({
+                message: "Saved ballot template not found."
+            });
+        }
+
+        const template = templates[0];
+
+        // Only allow deletion from the current election.
+        const [elections] = await db.execute(
+            `SELECT
+                election_id,
+                is_current,
+                archived_at,
+                status
+             FROM elections
+             WHERE election_id = ?
+             LIMIT 1`,
+            [template.election_id]
+        );
+
+        if (!elections.length) {
+            await db.rollback();
+            transactionStarted = false;
+
+            return res.status(404).json({
+                message: "Election not found."
+            });
+        }
+
+        const election = elections[0];
+
+        if (
+            Number(election.is_current) !== 1 ||
+            election.archived_at !== null ||
+            String(election.status || "")
+                .toLowerCase() === "completed"
+        ) {
+            await db.rollback();
+            transactionStarted = false;
+
+            return res.status(403).json({
+                message:
+                    "Cannot delete templates from archived, completed, or previous elections."
+            });
+        }
+
+        // Check whether QR batches have been created.
+        const [batches] = await db.execute(
+            `SELECT batch_id
+             FROM ballot_print_batches
+             WHERE template_id = ?
+             LIMIT 1`,
+            [templateId]
+        );
+
+        if (batches.length > 0) {
+            await db.rollback();
+            transactionStarted = false;
+
+            return res.status(409).json({
+                message:
+                    "Cannot delete this ballot. It already has a registered QR print batch."
+            });
+        }
+
+        // Check whether any issued ballots reference it.
+        const [issuedBallots] = await db.execute(
+            `SELECT ballot_id
+             FROM issued_ballots
+             WHERE template_id = ?
+             LIMIT 1`,
+            [templateId]
+        );
+
+        if (issuedBallots.length > 0) {
+            await db.rollback();
+            transactionStarted = false;
+
+            return res.status(409).json({
+                message:
+                    "Cannot delete this ballot. Registered QR ballots already exist."
+            });
+        }
+
+        // Delete saved OMR coordinates first.
+        await db.execute(
+            `DELETE FROM omr_grid_coordinates
+             WHERE template_id = ?`,
+            [templateId]
+        );
+
+        // Delete the unused template.
+        const [deleted] = await db.execute(
+            `DELETE FROM ballot_templates
+             WHERE template_id = ?
+               AND election_id = ?`,
+            [
+                templateId,
+                template.election_id
+            ]
+        );
+
+        if (deleted.affectedRows !== 1) {
+            throw new Error(
+                "Template could not be deleted."
+            );
+        }
+
+        await db.commit();
+        transactionStarted = false;
+
+        return res.status(200).json({
+            success: true,
+            message:
+                `Unused ballot #${templateId} deleted successfully.`,
+            template_id: templateId
+        });
+
+    } catch (error) {
+        if (db && transactionStarted) {
+            try {
+                await db.rollback();
+            } catch (rollbackError) {
+                console.error(
+                    "Rollback error:",
+                    rollbackError
+                );
+            }
+        }
+
+        console.error(
+            "Delete saved ballot error:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message:
+                "Failed to delete saved ballot template."
+        });
+
+    } finally {
+        if (db) {
+            db.release();
+        }
     }
 };

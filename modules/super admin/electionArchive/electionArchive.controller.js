@@ -1,15 +1,81 @@
+"use strict";
 
 const db = require("../../../config/db");
 
-const fail = (res, error) => {
-    console.error("Election archive:", error);
+const PH_NOW_SQL = "(UTC_TIMESTAMP() + INTERVAL 8 HOUR)";
 
+function validId(value) {
+    return Number.isSafeInteger(Number(value)) && Number(value) > 0;
+}
+
+function fail(res, error) {
+    console.error("Election archive:", error);
     return res.status(500).json({
         message: "Database operation failed"
     });
-};
+}
 
-// ================= ELECTION HISTORY =================
+// ======================================
+// SAFE TRANSACTION
+// ======================================
+
+async function lockedTransaction(callback) {
+    const conn = await db.getConnection();
+    let locked = false;
+    let started = false;
+
+    try {
+        const [[result]] = await conn.query(
+            "SELECT GET_LOCK('campusvote_election_cycle', 10) AS acquired"
+        );
+
+        if (result.acquired !== 1) {
+            throw new Error("Election management is busy. Please retry.");
+        }
+
+        locked = true;
+
+        await conn.beginTransaction();
+        started = true;
+
+        const output = await callback(conn);
+
+        if (output && output.code >= 400) {
+            await conn.rollback();
+        } else {
+            await conn.commit();
+        }
+
+        started = false;
+        return output;
+
+    } catch (error) {
+        if (started) {
+            try {
+                await conn.rollback();
+            } catch (e) {
+                console.error("Rollback failed:", e);
+            }
+        }
+        throw error;
+
+    } finally {
+        if (locked) {
+            try {
+                await conn.query(
+                    "SELECT RELEASE_LOCK('campusvote_election_cycle')"
+                );
+            } catch (e) {
+                console.error("Release lock failed:", e);
+            }
+        }
+        conn.release();
+    }
+}
+
+// ======================================
+// GET ELECTION HISTORY
+// ======================================
 
 exports.list = async (req, res) => {
     try {
@@ -23,6 +89,8 @@ exports.list = async (req, res) => {
                 e.is_active,
                 e.is_current,
                 e.archived_at,
+                e.scanning_open,
+                e.scanning_closed_at,
 
                 (
                     SELECT COUNT(*)
@@ -38,16 +106,134 @@ exports.list = async (req, res) => {
 
                 (
                     SELECT COUNT(*)
-                    FROM scanned_ballots b
-                    WHERE b.election_id = e.election_id
+                    FROM scanned_ballots s
+                    WHERE s.election_id = e.election_id
                 ) AS scanned_ballots_count
 
             FROM elections e
             ORDER BY e.election_id DESC
         `);
 
-        return res.status(200).json({
-            elections: rows
+        return res.json({ elections: rows });
+
+    } catch (error) {
+        return fail(res, error);
+    }
+};
+
+// ======================================
+// VIEW ELECTION DETAILS
+// READ ONLY
+// ======================================
+
+exports.details = async (req, res) => {
+    const electionId = Number(req.params.id);
+
+    if (!validId(electionId)) {
+        return res.status(400).json({
+            message: "Invalid election ID"
+        });
+    }
+
+    try {
+        const [elections] = await db.execute(
+            `SELECT
+                election_id,
+                title,
+                start_time,
+                end_time,
+                status,
+                is_current,
+                archived_at,
+                voting_closed_at,
+                scanning_closed_at
+             FROM elections
+             WHERE election_id = ?
+             LIMIT 1`,
+            [electionId]
+        );
+
+        if (!elections.length) {
+            return res.status(404).json({
+                message: "Election not found"
+            });
+        }
+
+        const [positions] = await db.execute(
+            `SELECT
+                position_id,
+                title,
+                max_selection,
+                display_order
+             FROM positions
+             WHERE election_id = ?
+             ORDER BY display_order, position_id`,
+            [electionId]
+        );
+
+        const [candidates] = await db.execute(
+            `SELECT
+                candidate_id,
+                position_id,
+                name,
+                course,
+                grade_level,
+                party_list
+             FROM candidates
+             WHERE election_id = ?
+             ORDER BY position_id, display_order, candidate_id`,
+            [electionId]
+        );
+
+        const [templates] = await db.execute(
+            `SELECT
+                template_id,
+                template_name,
+                paper_size
+             FROM ballot_templates
+             WHERE election_id = ?
+             ORDER BY template_id`,
+            [electionId]
+        );
+
+        const [ballots] = await db.execute(
+            `SELECT status, COUNT(*) AS total
+             FROM issued_ballots
+             WHERE election_id = ?
+             GROUP BY status`,
+            [electionId]
+        );
+
+        const [votes] = await db.execute(
+            `SELECT
+                v.position_id,
+                v.candidate_id,
+                COUNT(*) AS total_votes
+             FROM ballot_votes v
+             JOIN issued_ballots b
+                ON b.ballot_id = v.ballot_id
+             WHERE b.election_id = ?
+               AND b.status = 'COUNTED'
+             GROUP BY v.position_id, v.candidate_id`,
+            [electionId]
+        );
+
+        const [scans] = await db.execute(
+            `SELECT COUNT(*) AS total
+             FROM scanned_ballots
+             WHERE election_id = ?`,
+            [electionId]
+        );
+
+        return res.json({
+            election: elections[0],
+            positions,
+            candidates,
+            templates,
+            ballot_status_counts: ballots,
+            recorded_votes: votes,
+            scanned_ballots_count: Number(scans[0].total),
+            note: "Read-only historical data from saved database records."
         });
 
     } catch (error) {
@@ -55,59 +241,14 @@ exports.list = async (req, res) => {
     }
 };
 
-// ================= SAFE TRANSACTION =================
-
-async function lockedTransaction(callback) {
-    const conn = await db.getConnection();
-    let locked = false;
-
-    try {
-        const [[result]] = await conn.query(
-            "SELECT GET_LOCK('campusvote_election_cycle', 10) AS acquired"
-        );
-
-        if (result.acquired !== 1) {
-            throw new Error(
-                "Election management is busy. Please retry."
-            );
-        }
-
-        locked = true;
-
-        await conn.beginTransaction();
-
-        const output = await callback(conn);
-
-        await conn.commit();
-
-        return output;
-
-    } catch (error) {
-        try {
-            await conn.rollback();
-        } catch (_) {}
-
-        throw error;
-
-    } finally {
-        if (locked) {
-            try {
-                await conn.query(
-                    "SELECT RELEASE_LOCK('campusvote_election_cycle')"
-                );
-            } catch (_) {}
-        }
-
-        conn.release();
-    }
-}
-
-// ================= ARCHIVE ELECTION =================
+// ======================================
+// ARCHIVE ELECTION
+// ======================================
 
 exports.archive = async (req, res) => {
-    const id = Number(req.params.id);
+    const electionId = Number(req.params.id);
 
-    if (!Number.isSafeInteger(id) || id <= 0) {
+    if (!validId(electionId)) {
         return res.status(400).json({
             message: "Invalid election ID"
         });
@@ -115,13 +256,19 @@ exports.archive = async (req, res) => {
 
     try {
         const result = await lockedTransaction(async conn => {
-
             const [rows] = await conn.execute(
-                `SELECT election_id, status, archived_at
+                `SELECT
+                    election_id,
+                    status,
+                    is_current,
+                    archived_at,
+                    voting_closed_at,
+                    scanning_open,
+                    scanning_closed_at
                  FROM elections
                  WHERE election_id = ?
                  FOR UPDATE`,
-                [id]
+                [electionId]
             );
 
             if (!rows.length) {
@@ -131,45 +278,88 @@ exports.archive = async (req, res) => {
                 };
             }
 
-            if (rows[0].archived_at) {
+            const election = rows[0];
+
+            if (election.archived_at) {
                 return {
                     code: 409,
                     message: "Election already archived"
                 };
             }
 
-            if (rows[0].status !== "completed") {
+            if (election.status !== "completed") {
                 return {
                     code: 409,
                     message: "Stop voting before archiving this election"
                 };
             }
 
+            if (!election.voting_closed_at) {
+                return {
+                    code: 409,
+                    message: "Voting must be closed before archiving."
+                };
+            }
+
+            if (Number(election.scanning_open) !== 0) {
+                return {
+                    code: 409,
+                    message: "Finish scanning before archiving."
+                };
+            }
+
+            if (!election.scanning_closed_at) {
+                return {
+                    code: 409,
+                    message: "Finish Scanning has not been completed yet."
+                };
+            }
+
+            const [pending] = await conn.execute(
+                `SELECT COUNT(*) AS total
+                 FROM issued_ballots
+                 WHERE election_id = ?
+                   AND status = 'CAST'`,
+                [electionId]
+            );
+
+            const pendingCount = Number(pending[0].total);
+
+            if (pendingCount > 0) {
+                return {
+                    code: 409,
+                    message:
+                        `${pendingCount} received ballot(s) are not yet counted.`
+                };
+            }
+
             await conn.execute(
                 `UPDATE elections
-                 SET archived_at = NOW(),
+                 SET archived_at = ${PH_NOW_SQL},
                      is_current = 0,
                      is_active = 0
                  WHERE election_id = ?`,
-                [id]
+                [electionId]
             );
 
             return {
                 code: 200,
-                message: "Election archived; historical data preserved"
+                message: "Election archived. Historical data preserved.",
+                election_id: electionId,
+                archived: true
             };
         });
 
-        return res.status(result.code).json({
-            message: result.message
-        });
+        return res.status(result.code).json(result);
 
     } catch (error) {
         return fail(res, error);
     }
 };
 
-// ================= CREATE NEW ELECTION =================
+// ======================================
+// CREATE NEW ELECTION
+// ======================================
 
 exports.create = async (req, res) => {
     const title = String(req.body?.title || "").trim();
@@ -186,7 +376,8 @@ exports.create = async (req, res) => {
         });
     }
 
-    const dateFormat = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+    const dateFormat =
+        /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
     if (
         !dateFormat.test(start) ||
@@ -194,16 +385,11 @@ exports.create = async (req, res) => {
         start >= end
     ) {
         return res.status(400).json({
-            message:
-                "Provide valid start_time and end_time " +
-                "in YYYY-MM-DD HH:mm:ss, with start before end"
+            message: "Invalid start or end date"
         });
     }
 
-    if (
-        copyId !== null &&
-        (!Number.isSafeInteger(copyId) || copyId <= 0)
-    ) {
+    if (copyId !== null && !validId(copyId)) {
         return res.status(400).json({
             message: "Invalid source election ID"
         });
@@ -211,7 +397,6 @@ exports.create = async (req, res) => {
 
     try {
         const result = await lockedTransaction(async conn => {
-
             const [current] = await conn.query(
                 `SELECT election_id
                  FROM elections
@@ -224,8 +409,7 @@ exports.create = async (req, res) => {
                 return {
                     code: 409,
                     message:
-                        "Archive the current completed election " +
-                        "before creating a new one"
+                        "Archive the current election before creating a new one."
                 };
             }
 
@@ -247,35 +431,35 @@ exports.create = async (req, res) => {
 
             const [insert] = await conn.execute(
                 `INSERT INTO elections
-                 (
-                     title,
-                     start_time,
-                     end_time,
-                     status,
-                     is_active,
-                     mask_names,
-                     is_current
-                 )
-                 VALUES (?, ?, ?, NULL, 0, 0, 1)`,
+                (
+                    title,
+                    start_time,
+                    end_time,
+                    status,
+                    is_active,
+                    mask_names,
+                    is_current
+                )
+                VALUES (?, ?, ?, NULL, 0, 0, 1)`,
                 [title, start, end]
             );
 
             if (copyId !== null) {
                 await conn.execute(
                     `INSERT INTO positions
-                     (
-                         election_id,
-                         title,
-                         max_selection,
-                         display_order
-                     )
-                     SELECT
-                         ?,
-                         title,
-                         max_selection,
-                         display_order
-                     FROM positions
-                     WHERE election_id = ?`,
+                    (
+                        election_id,
+                        title,
+                        max_selection,
+                        display_order
+                    )
+                    SELECT
+                        ?,
+                        title,
+                        max_selection,
+                        display_order
+                    FROM positions
+                    WHERE election_id = ?`,
                     [insert.insertId, copyId]
                 );
             }

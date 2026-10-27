@@ -1,120 +1,187 @@
-const connection = require("../../config/db"); // mysql2 pool with .promise()
 
-async function getElectionOrFail(election_id, res) {
-    const [rows] = await connection.execute(
-        "SELECT election_id, title, start_time, end_time, status, is_active, mask_names FROM elections WHERE election_id = ? LIMIT 1",
-        [election_id],
-    );
-    if (rows.length === 0) {
-        res.status(404).json({ message: "Election not found" });
-        return null;
+"use strict";
+
+const connection = require("../../config/db");
+
+// Resolve current election or a specific historical election.
+async function resolveElection(electionId) {
+    const value = String(electionId ?? "").trim();
+
+    let sql;
+    let params = [];
+
+    if (value.toLowerCase() === "current") {
+        sql = `
+            SELECT election_id, title, start_time, end_time,
+                   status, is_active, mask_names
+            FROM elections
+            WHERE is_current = 1
+              AND archived_at IS NULL
+            LIMIT 1
+        `;
+    } else if (/^[1-9]\d*$/.test(value)) {
+        sql = `
+            SELECT election_id, title, start_time, end_time,
+                   status, is_active, mask_names
+            FROM elections
+            WHERE election_id = ?
+            LIMIT 1
+        `;
+        params = [value];
+    } else {
+        const error = new Error("Invalid election ID");
+        error.status = 400;
+        throw error;
     }
+
+    const [rows] = await connection.execute(sql, params);
+
+    if (!rows.length) {
+        const error = new Error(
+            value.toLowerCase() === "current"
+                ? "No current election found"
+                : "Election not found"
+        );
+        error.status = 404;
+        throw error;
+    }
+
     return rows[0];
 }
 
-// Election header info: title, schedule, status, whether names are currently masked
+function sendError(res, error, label) {
+    console.error(label, error);
+
+    return res.status(error.status || 500).json({
+        message: error.status
+            ? error.message
+            : "Internal server error"
+    });
+}
+
+function shouldRevealNames(election) {
+    return (
+        String(election.status).toLowerCase() === "completed" &&
+        !Boolean(Number(election.mask_names))
+    );
+}
+
+// Election status
 exports.getElectionStatus = async (req, res) => {
     try {
-        const { election_id } = req.params;
-        const election = await getElectionOrFail(election_id, res);
-        if (!election) return;
+        const election = await resolveElection(
+            req.params.election_id
+        );
+
         return res.status(200).json({ election });
     } catch (error) {
-        console.error("Get dashboard election status error:", error);
-        return res.status(500).json({ message: "Internal server error" });
+        return sendError(
+            res, error, "Get dashboard election status error:"
+        );
     }
 };
 
-// Candidates for this election, grouped by position. Any candidate an adviser adds
-// via adviser.addCandidate shows up here automatically — this reads live from the
-// candidates table, no separate step needed to "publish" them to the dashboard.
+// Election candidates
 exports.getCandidates = async (req, res) => {
     try {
-        const { election_id } = req.params;
-        const election = await getElectionOrFail(election_id, res);
-        if (!election) return;
-
-        const [rows] = await connection.execute(
-            `SELECT c.candidate_id, c.name, c.course, c.grade_level, c.party_list,
-                    c.position_id, c.display_order, p.title AS position_title
-             FROM candidates c
-             JOIN positions p ON p.position_id = c.position_id
-             WHERE p.election_id = ?
-             ORDER BY p.display_order, c.display_order`,
-            [election_id],
+        const election = await resolveElection(
+            req.params.election_id
         );
 
-        const candidates = rows.map((c) => ({
-            ...c,
-            name: election.mask_names ? `Candidate #${c.candidate_id}` : c.name,
+        const [rows] = await connection.execute(
+            `SELECT
+                c.candidate_id,
+                c.name,
+                c.course,
+                c.grade_level,
+                c.party_list,
+                c.position_id,
+                c.display_order,
+                p.title AS position_title
+             FROM candidates c
+             INNER JOIN positions p
+                ON p.position_id = c.position_id
+             WHERE p.election_id = ?
+             ORDER BY p.display_order,
+                      c.display_order,
+                      c.candidate_id`,
+            [election.election_id]
+        );
+
+        const reveal = shouldRevealNames(election);
+
+        const candidates = rows.map(candidate => ({
+            ...candidate,
+            name: reveal
+                ? candidate.name
+                : `Candidate #${candidate.candidate_id}`
         }));
 
-        return res.status(200).json({ mask_names: !!election.mask_names, candidates });
+        return res.status(200).json({
+            mask_names: !reveal,
+            candidates
+        });
     } catch (error) {
-        console.error("Get dashboard candidates error:", error);
-        return res.status(500).json({ message: "Internal server error" });
+        return sendError(
+            res, error, "Get dashboard candidates error:"
+        );
     }
 };
 
-// Live vote tallies. Reads straight from v_live_tallies, so every vote the OMR
-// module records via ballot_votes shows up here the moment it's inserted.
+// Vote tallies
 exports.getTallies = async (req, res) => {
     try {
-        const { election_id } = req.params;
-        const election = await getElectionOrFail(election_id, res);
-        if (!election) return;
-
-        const [rows] = await connection.execute(
-            "SELECT * FROM v_live_tallies WHERE election_id = ? ORDER BY position_id, total_votes DESC",
-            [election_id],
+        const election = await resolveElection(
+            req.params.election_id
         );
 
-        const tallies = rows.map((t) => ({
-            ...t,
-            candidate_name: election.mask_names ? `Candidate #${t.candidate_id}` : t.candidate_name,
+        const [rows] = await connection.execute(
+            `SELECT *
+             FROM v_live_tallies
+             WHERE election_id = ?
+             ORDER BY position_id, total_votes DESC`,
+            [election.election_id]
+        );
+
+        const reveal = shouldRevealNames(election);
+
+        const tallies = rows.map(tally => ({
+            ...tally,
+            candidate_name: reveal
+                ? tally.candidate_name
+                : `Candidate #${tally.candidate_id}`
         }));
 
-        return res.status(200).json({ mask_names: !!election.mask_names, tallies });
+        return res.status(200).json({
+            mask_names: !reveal,
+            tallies
+        });
     } catch (error) {
-        console.error("Get dashboard tallies error:", error);
-        return res.status(500).json({ message: "Internal server error" });
+        return sendError(
+            res, error, "Get dashboard tallies error:"
+        );
     }
 };
 
-
+// Full dashboard overview
 exports.getOverview = async (req, res) => {
     try {
-        const { election_id } = req.params;
-
-        if (!/^[1-9]\d*$/.test(String(election_id))) {
-            return res.status(400).json({
-                message: "Invalid election ID"
-            });
-        }
-
-        const [elections] = await connection.execute(
-            `SELECT election_id, title, start_time, end_time,
-                    status, is_active, mask_names
-             FROM elections
-             WHERE election_id = ?`,
-            [election_id]
+        const election = await resolveElection(
+            req.params.election_id
         );
 
-        if (!elections.length) {
-            return res.status(404).json({
-                message: "Election not found"
-            });
-        }
-
-        const election = elections[0];
+        const electionId = election.election_id;
 
         const [positions] = await connection.execute(
-            `SELECT position_id, title AS position_title,
-                    max_selection, display_order
+            `SELECT
+                position_id,
+                title AS position_title,
+                max_selection,
+                display_order
              FROM positions
              WHERE election_id = ?
              ORDER BY display_order, position_id`,
-            [election_id]
+            [electionId]
         );
 
         const [candidates] = await connection.execute(
@@ -128,6 +195,8 @@ exports.getOverview = async (req, res) => {
                 c.display_order,
                 COUNT(bv.vote_id) AS total_votes
              FROM candidates c
+             INNER JOIN positions p
+                ON p.position_id = c.position_id
              LEFT JOIN ballot_votes bv
                 ON bv.candidate_id = c.candidate_id
                 AND bv.position_id = c.position_id
@@ -137,7 +206,7 @@ exports.getOverview = async (req, res) => {
                     WHERE sb.ballot_id = bv.ballot_id
                       AND sb.election_id = ?
                 )
-             WHERE c.election_id = ?
+             WHERE p.election_id = ?
              GROUP BY
                 c.candidate_id,
                 c.position_id,
@@ -147,30 +216,29 @@ exports.getOverview = async (req, res) => {
                 c.party_list,
                 c.display_order
              ORDER BY c.display_order, c.candidate_id`,
-            [election_id, election_id]
+            [electionId, electionId]
         );
 
-        const closed =
-            String(election.status).toLowerCase() === "completed";
-
-        const revealNames =
-            closed && !Boolean(election.mask_names);
+        const revealNames = shouldRevealNames(election);
 
         const result = positions.map(position => ({
             position_id: position.position_id,
             position_title: position.position_title,
             max_selection: position.max_selection,
             candidates: candidates
-                .filter(c => c.position_id === position.position_id)
-                .map(c => ({
-                    candidate_id: c.candidate_id,
+                .filter(candidate =>
+                    Number(candidate.position_id) ===
+                    Number(position.position_id)
+                )
+                .map(candidate => ({
+                    candidate_id: candidate.candidate_id,
                     name: revealNames
-                        ? c.name
-                        : `Candidate #${c.candidate_id}`,
-                    course: c.course,
-                    grade_level: c.grade_level,
-                    party_list: c.party_list,
-                    total_votes: Number(c.total_votes)
+                        ? candidate.name
+                        : `Candidate #${candidate.candidate_id}`,
+                    course: candidate.course,
+                    grade_level: candidate.grade_level,
+                    party_list: candidate.party_list,
+                    total_votes: Number(candidate.total_votes)
                 }))
         }));
 
@@ -178,7 +246,7 @@ exports.getOverview = async (req, res) => {
             `SELECT COUNT(*) AS total
              FROM scanned_ballots
              WHERE election_id = ?`,
-            [election_id]
+            [electionId]
         );
 
         return res.status(200).json({
@@ -191,11 +259,8 @@ exports.getOverview = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Dashboard overview error:", error);
-
-        return res.status(500).json({
-            message: "Internal server error"
-        });
+        return sendError(
+            res, error, "Dashboard overview error:"
+        );
     }
 };
-

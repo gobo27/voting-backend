@@ -15,5 +15,4 @@ router.get("/accounts", adminController.getAccounts);
 
 // Delete account 
 router.delete("/accounts/:id", adminController.deleteAccount);
-
 module.exports = router;

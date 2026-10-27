@@ -1,34 +1,179 @@
 
-const crypto = require("crypto");
+"use strict";
+
 const sharp = require("sharp");
+const jsQR = require("jsqr");
 const pool = require("../../../config/db");
 
-const EXPECTED_WIDTH = 2480;
-const EXPECTED_HEIGHT = 1754;
+const DPI = 300;
 
-const DARK_LIMIT = 110;
-const MIN_FILL_PERCENT = 60;
+const PAPER_WIDTH = 2480;
+const PAPER_HEIGHT = 1754;
+
+const COUNTING_SENSITIVITY = 2;
+
+const mm = value => value * DPI / 25.4;
+
+// ============================================================
+// COMMON HELPERS
+// ============================================================
 
 function validId(value) {
-    return Number.isSafeInteger(Number(value)) &&
-        Number(value) > 0;
+    const number = Number(value);
+
+    return (
+        Number.isSafeInteger(number) &&
+        number > 0
+    );
 }
 
-// =====================================
-// GET TEMPLATE AND SAVED COORDINATES
-// =====================================
+function median(values) {
+    if (!values.length) {
+        return 255;
+    }
+
+    const sorted = [...values].sort(
+        (a, b) => a - b
+    );
+
+    const middle = Math.floor(
+        sorted.length / 2
+    );
+
+    if (sorted.length % 2) {
+        return sorted[middle];
+    }
+
+    return (
+        sorted[middle - 1] +
+        sorted[middle]
+    ) / 2;
+}
+
+// ============================================================
+// QR PARSING
+// ============================================================
+
+function parseQR(qrData) {
+    const parts = String(qrData || "")
+        .trim()
+        .split("|");
+
+    const uuidPattern =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    if (
+        parts.length !== 4 ||
+        parts[0] !== "CV1" ||
+        !validId(parts[1]) ||
+        !uuidPattern.test(parts[2]) ||
+        !validId(parts[3])
+    ) {
+        throw new Error(
+            "Invalid CampusVote ballot QR code."
+        );
+    }
+
+    return {
+        election_id: Number(parts[1]),
+        ballot_id: parts[2].toLowerCase(),
+        template_id: Number(parts[3])
+    };
+}
+
+// ============================================================
+// READ QR FROM IMAGE
+// ============================================================
+
+async function readBallotQR(imagePath) {
+    const { data, info } = await sharp(imagePath)
+        .rotate()
+        .ensureAlpha()
+        .raw()
+        .toBuffer({
+            resolveWithObject: true
+        });
+
+    let result = jsQR(
+        new Uint8ClampedArray(data),
+        info.width,
+        info.height,
+        {
+            inversionAttempts: "attemptBoth"
+        }
+    );
+
+    // Retry the upper-right area if full-image
+    // QR detection fails.
+
+    if (!result) {
+        const cropX = Math.floor(
+            info.width * 0.65
+        );
+
+        const cropWidth =
+            info.width - cropX;
+
+        const cropHeight = Math.max(
+            1,
+            Math.floor(info.height * 0.40)
+        );
+
+        const crop = await sharp(imagePath)
+            .rotate()
+            .extract({
+                left: cropX,
+                top: 0,
+                width: cropWidth,
+                height: cropHeight
+            })
+            .ensureAlpha()
+            .raw()
+            .toBuffer({
+                resolveWithObject: true
+            });
+
+        result = jsQR(
+            new Uint8ClampedArray(crop.data),
+            crop.info.width,
+            crop.info.height,
+            {
+                inversionAttempts: "attemptBoth"
+            }
+        );
+    }
+
+    if (!result) {
+        throw new Error(
+            "QR code not detected. No votes recorded."
+        );
+    }
+
+    return parseQR(result.data);
+}
+
+// ============================================================
+// LOAD SAVED BALLOT TEMPLATE
+// ============================================================
+
 async function getTemplateCoordinates(
     db,
     templateId,
     electionId
 ) {
     const [templates] = await db.execute(
-        `SELECT template_id, election_id, paper_size
+        `SELECT
+            template_id,
+            election_id,
+            paper_size
          FROM ballot_templates
          WHERE template_id = ?
-         AND election_id = ?
+           AND election_id = ?
          LIMIT 1`,
-        [templateId, electionId]
+        [
+            templateId,
+            electionId
+        ]
     );
 
     if (!templates.length) {
@@ -50,13 +195,21 @@ async function getTemplateCoordinates(
             p.max_selection
          FROM omr_grid_coordinates g
          JOIN candidates c
-            ON c.candidate_id = g.candidate_id
+           ON c.candidate_id = g.candidate_id
          JOIN positions p
-            ON p.position_id = c.position_id
+           ON p.position_id = c.position_id
          WHERE g.template_id = ?
-         AND p.election_id = ?
-         ORDER BY p.position_id, g.y_pos, g.x_pos`,
-        [templateId, electionId]
+           AND c.election_id = ?
+           AND p.election_id = ?
+         ORDER BY
+            p.position_id,
+            g.y_pos,
+            g.x_pos`,
+        [
+            templateId,
+            electionId,
+            electionId
+        ]
     );
 
     return {
@@ -65,271 +218,958 @@ async function getTemplateCoordinates(
     };
 }
 
-// =====================================
-// SCAN AND PROCESS BALLOT
-// =====================================
+// ============================================================
+// FIND FOUR REGISTRATION MARKERS
+// ============================================================
+
+async function findMarkers(
+    imagePath,
+    originalWidth,
+    originalHeight
+) {
+    const scale = Math.min(
+        1,
+        1100 / Math.max(
+            originalWidth,
+            originalHeight
+        )
+    );
+
+    const w = Math.max(
+        1,
+        Math.round(originalWidth * scale)
+    );
+
+    const h = Math.max(
+        1,
+        Math.round(originalHeight * scale)
+    );
+
+    const { data } = await sharp(imagePath)
+        .rotate()
+        .resize(w, h, {
+            fit: "fill"
+        })
+        .grayscale()
+        .raw()
+        .toBuffer({
+            resolveWithObject: true
+        });
+
+    const mask = new Uint8Array(w * h);
+    const seen = new Uint8Array(w * h);
+
+    for (let i = 0; i < mask.length; i++) {
+        mask[i] = data[i] < 95 ? 1 : 0;
+    }
+
+    const corners = [
+        [0, 0],
+        [w - 1, 0],
+        [0, h - 1],
+        [w - 1, h - 1]
+    ];
+
+    const found = [];
+
+    for (const [cx, cy] of corners) {
+        const x0 = cx === 0
+            ? 0
+            : Math.floor(w * 0.66);
+
+        const x1 = cx === 0
+            ? Math.ceil(w * 0.34)
+            : w;
+
+        const y0 = cy === 0
+            ? 0
+            : Math.floor(h * 0.66);
+
+        const y1 = cy === 0
+            ? Math.ceil(h * 0.34)
+            : h;
+
+        let best = null;
+
+        for (let yy = y0; yy < y1; yy++) {
+            for (let xx = x0; xx < x1; xx++) {
+                const start = yy * w + xx;
+
+                if (
+                    !mask[start] ||
+                    seen[start]
+                ) {
+                    continue;
+                }
+
+                const stack = [start];
+
+                seen[start] = 1;
+
+                let area = 0;
+                let minX = xx;
+                let maxX = xx;
+                let minY = yy;
+                let maxY = yy;
+                let sx = 0;
+                let sy = 0;
+
+                while (stack.length) {
+                    const n = stack.pop();
+
+                    const px = n % w;
+                    const py = Math.floor(n / w);
+
+                    area++;
+
+                    sx += px;
+                    sy += py;
+
+                    minX = Math.min(minX, px);
+                    maxX = Math.max(maxX, px);
+                    minY = Math.min(minY, py);
+                    maxY = Math.max(maxY, py);
+
+                    if (px > x0) {
+                        const q = n - 1;
+
+                        if (
+                            mask[q] &&
+                            !seen[q]
+                        ) {
+                            seen[q] = 1;
+                            stack.push(q);
+                        }
+                    }
+
+                    if (px + 1 < x1) {
+                        const q = n + 1;
+
+                        if (
+                            mask[q] &&
+                            !seen[q]
+                        ) {
+                            seen[q] = 1;
+                            stack.push(q);
+                        }
+                    }
+
+                    if (py > y0) {
+                        const q = n - w;
+
+                        if (
+                            mask[q] &&
+                            !seen[q]
+                        ) {
+                            seen[q] = 1;
+                            stack.push(q);
+                        }
+                    }
+
+                    if (py + 1 < y1) {
+                        const q = n + w;
+
+                        if (
+                            mask[q] &&
+                            !seen[q]
+                        ) {
+                            seen[q] = 1;
+                            stack.push(q);
+                        }
+                    }
+                }
+
+                const bw = maxX - minX + 1;
+                const bh = maxY - minY + 1;
+
+                const ratio = bw / bh;
+                const density = area / (bw * bh);
+
+                if (
+                    area < 8 ||
+                    bw < 3 ||
+                    bh < 3 ||
+                    bw > w * 0.08 ||
+                    bh > h * 0.08 ||
+                    ratio < 0.6 ||
+                    ratio > 1.65 ||
+                    density < 0.72
+                ) {
+                    continue;
+                }
+
+                const mx = sx / area;
+                const my = sy / area;
+
+                const distance = Math.hypot(
+                    mx - cx,
+                    my - cy
+                );
+
+                const score =
+                    area / (1 + distance);
+
+                if (
+                    !best ||
+                    score > best.score
+                ) {
+                    best = {
+                        x: mx / scale,
+                        y: my / scale,
+                        score
+                    };
+                }
+            }
+        }
+
+        if (!best) {
+            throw new Error(
+                "Four registration squares not detected. " +
+                "Keep all four corners visible."
+            );
+        }
+
+        found.push(best);
+    }
+
+    const [tl, tr, bl, br] = found;
+
+    const topWidth = Math.hypot(
+        tr.x - tl.x,
+        tr.y - tl.y
+    );
+
+    const bottomWidth = Math.hypot(
+        br.x - bl.x,
+        br.y - bl.y
+    );
+
+    const leftHeight = Math.hypot(
+        bl.x - tl.x,
+        bl.y - tl.y
+    );
+
+    const rightHeight = Math.hypot(
+        br.x - tr.x,
+        br.y - tr.y
+    );
+
+    if (
+        Math.min(topWidth, bottomWidth) <
+            originalWidth * 0.35 ||
+        Math.min(leftHeight, rightHeight) <
+            originalHeight * 0.35
+    ) {
+        throw new Error(
+            "Registration markers are too close. " +
+            "Check image crop and alignment."
+        );
+    }
+
+    return found;
+}
+
+// ============================================================
+// SOLVE 8 EQUATIONS
+// ============================================================
+
+function solve8(A, b) {
+    for (let i = 0; i < 8; i++) {
+        let pivot = i;
+
+        for (let j = i + 1; j < 8; j++) {
+            if (
+                Math.abs(A[j][i]) >
+                Math.abs(A[pivot][i])
+            ) {
+                pivot = j;
+            }
+        }
+
+        [A[i], A[pivot]] = [
+            A[pivot],
+            A[i]
+        ];
+
+        [b[i], b[pivot]] = [
+            b[pivot],
+            b[i]
+        ];
+
+        if (Math.abs(A[i][i]) < 1e-10) {
+            throw new Error(
+                "Invalid marker geometry."
+            );
+        }
+
+        const divisor = A[i][i];
+
+        for (let k = i; k < 8; k++) {
+            A[i][k] /= divisor;
+        }
+
+        b[i] /= divisor;
+
+        for (let j = 0; j < 8; j++) {
+            if (j === i) continue;
+
+            const factor = A[j][i];
+
+            for (let k = i; k < 8; k++) {
+                A[j][k] -= factor * A[i][k];
+            }
+
+            b[j] -= factor * b[i];
+        }
+    }
+
+    return b;
+}
+
+// ============================================================
+// PERSPECTIVE HOMOGRAPHY
+// ============================================================
+
+function homography(from, to) {
+    const A = [];
+    const b = [];
+
+    for (let i = 0; i < 4; i++) {
+        const { x, y } = from[i];
+
+        const {
+            x: u,
+            y: v
+        } = to[i];
+
+        A.push([
+            x, y, 1,
+            0, 0, 0,
+            -u * x, -u * y
+        ]);
+
+        b.push(u);
+
+        A.push([
+            0, 0, 0,
+            x, y, 1,
+            -v * x, -v * y
+        ]);
+
+        b.push(v);
+    }
+
+    return solve8(A, b);
+}
+
+// ============================================================
+// PROJECT SAVED COORDINATES ONTO SCANNED IMAGE
+// ============================================================
+
+function project(H, x, y) {
+    const d =
+        H[6] * x +
+        H[7] * y +
+        1;
+
+    if (Math.abs(d) < 1e-10) {
+        return null;
+    }
+
+    return {
+        x: (
+            H[0] * x +
+            H[1] * y +
+            H[2]
+        ) / d,
+
+        y: (
+            H[3] * x +
+            H[4] * y +
+            H[5]
+        ) / d
+    };
+}
+
+// ============================================================
+// SAMPLE PIXEL BRIGHTNESS
+// ============================================================
+
+function sample(image, H, x, y) {
+    const point = project(H, x, y);
+
+    if (!point) {
+        return null;
+    }
+
+    const px = Math.round(point.x);
+    const py = Math.round(point.y);
+
+    if (
+        px < 0 ||
+        py < 0 ||
+        px >= image.width ||
+        py >= image.height
+    ) {
+        return null;
+    }
+
+    return image.data[
+        py * image.width + px
+    ];
+}
+
+// ============================================================
+// ADAPTIVE SHADE DETECTION
+// ============================================================
+
+function measure(
+    image,
+    H,
+    coordinate,
+    sensitivity
+) {
+    const x = Number(coordinate.x_pos);
+    const y = Number(coordinate.y_pos);
+    const w = Number(coordinate.width);
+    const h = Number(coordinate.height);
+
+    if (
+        ![x, y, w, h].every(Number.isFinite) ||
+        w <= 0 ||
+        h <= 0 ||
+        x < 0 ||
+        y < 0 ||
+        x + w > PAPER_WIDTH ||
+        y + h > PAPER_HEIGHT
+    ) {
+        throw new Error(
+            "Invalid saved bubble coordinates."
+        );
+    }
+
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+
+    const inside = [];
+    const paper = [];
+
+    // Sample the center of the bubble.
+    // Avoid its printed circular outline.
+
+    for (let j = -12; j <= 12; j++) {
+        for (let i = -12; i <= 12; i++) {
+            const r = Math.hypot(
+                i / 12,
+                j / 12
+            );
+
+            if (r > 0.60) {
+                continue;
+            }
+
+            const value = sample(
+                image,
+                H,
+                cx + (i / 12) * w * 0.42,
+                cy + (j / 12) * h * 0.42
+            );
+
+            if (value !== null) {
+                inside.push(value);
+            }
+        }
+    }
+
+    // Sample surrounding paper to calculate
+    // local background brightness.
+
+    for (let j = -16; j <= 16; j++) {
+        for (let i = -16; i <= 16; i++) {
+            const r = Math.hypot(
+                i / 16,
+                j / 16
+            );
+
+            if (
+                r < 0.75 ||
+                r > 1
+            ) {
+                continue;
+            }
+
+            const value = sample(
+                image,
+                H,
+                cx + (i / 16) * w * 0.95,
+                cy + (j / 16) * h * 0.95
+            );
+
+            if (value !== null) {
+                paper.push(value);
+            }
+        }
+    }
+
+    if (
+        inside.length < 50 ||
+        paper.length < 12
+    ) {
+        throw new Error(
+            "Insufficient bubble samples. " +
+            "Check image alignment."
+        );
+    }
+
+    const sortedPaper = [...paper].sort(
+        (a, b) => a - b
+    );
+
+    const brightPaper = sortedPaper.slice(
+        Math.floor(sortedPaper.length * 0.5)
+    );
+
+    const baseline = median(brightPaper);
+
+    const differences = inside.map(
+        value => Math.max(
+            0,
+            baseline - value
+        )
+    );
+
+    const average =
+        differences.reduce(
+            (sum, value) => sum + value,
+            0
+        ) / differences.length;
+
+    const settings = {
+        1: {
+            contrast: 32,
+            minimum: 21,
+            requiredMarked: 0.32
+        },
+
+        2: {
+            contrast: 21,
+            minimum: 13,
+            requiredMarked: 0.24
+        },
+
+        3: {
+            contrast: 13,
+            minimum: 8,
+            requiredMarked: 0.19
+        }
+    };
+
+    const setting =
+        settings[sensitivity] ||
+        settings[2];
+
+    const marked =
+        differences.filter(
+            value => value > setting.contrast
+        ).length / differences.length;
+
+    return {
+        selected:
+            average >= setting.minimum &&
+            marked >= setting.requiredMarked,
+
+        average,
+        marked,
+        baseline
+    };
+}
+
+// ============================================================
+// VERIFY QR AGAINST MYSQL
+// ============================================================
+
+
+exports.verifyQR = async (req, res) => {
+    try {
+        const qr = parseQR(req.body?.qr_data);
+        const [rows] = await pool.execute(
+            `SELECT ballot_id, election_id, template_id, status
+             FROM issued_ballots
+             WHERE ballot_id = ? AND election_id = ? AND template_id = ?
+             LIMIT 1`,
+            [qr.ballot_id, qr.election_id, qr.template_id]
+        );
+
+        if (!rows.length) {
+            return res.status(422).json({
+                valid: false,
+                message: "Unregistered ballot."
+            });
+        }
+
+        const ballot = rows[0];
+
+        if (ballot.status === "COUNTED") {
+            return res.status(409).json({
+                valid: false,
+                duplicate: true,
+                status: "COUNTED",
+                message: "Duplicate ballot. Already counted."
+            });
+        }
+
+        if (ballot.status === "VOID") {
+            return res.status(409).json({
+                valid: false,
+                status: "VOID",
+                message: "This ballot has been voided."
+            });
+        }
+
+        if (!["ISSUED", "CAST"].includes(ballot.status)) {
+            return res.status(409).json({
+                valid: false,
+                status: ballot.status,
+                message: "Ballot is not eligible for scanning."
+            });
+        }
+
+        return res.json({
+            valid: true,
+            duplicate: false,
+            status: ballot.status,
+            ballot_id: ballot.ballot_id,
+            election_id: ballot.election_id,
+            template_id: ballot.template_id,
+            message: "Valid ballot. Ready for OMR analysis."
+        });
+    } catch (error) {
+        const invalid = error.message === "Invalid CampusVote ballot QR code.";
+        if (!invalid) console.error("QR verification error:", error);
+
+        return res.status(invalid ? 422 : 500).json({
+            valid: false,
+            message: invalid ? error.message : "QR verification failed."
+        });
+    }
+};
+
+
+// ============================================================
+// UPLOAD AND PROCESS BALLOT
+// ============================================================
+
+
 exports.uploadAndProcess = async (req, res) => {
     let db;
-    let transactionStarted = false;
+    const preview = req.omrPreview === true;
+    const counting = req.omrCounting === true;
+
+    const fail = (code, message, extra = {}) =>
+        res.status(code).json({
+            success: false,
+            preview_only: !counting,
+            message,
+            ...extra
+        });
 
     try {
-        const electionId = Number(req.body.election_id);
-        const templateId = Number(req.body.template_id);
+        if (!preview && !counting) {
+            return fail(403, "Invalid OMR processing mode.");
+        }
 
-        if (
-            !req.file ||
-            !validId(electionId) ||
-            !validId(templateId)
-        ) {
-            return res.status(400).json({
-                message:
-                    "Valid election_id, template_id and ballot_image are required."
-            });
+        if (counting && process.env.OMR_COUNTING_ENABLED !== "true") {
+            return fail(403, "Live counting is disabled.");
+        }
+
+        const electionId = Number(req.body?.election_id);
+        const templateId = Number(req.body?.template_id);
+
+        if (!req.file || !validId(electionId) || !validId(templateId)) {
+            return fail(400, "Ballot image, election ID and template ID are required.");
+        }
+
+        let qr;
+        try {
+            qr = await readBallotQR(req.file.path);
+        } catch (error) {
+            return fail(422, error.message);
+        }
+
+        if (qr.election_id !== electionId || qr.template_id !== templateId) {
+            return fail(422, "QR does not match the selected election or template.");
         }
 
         db = await pool.getConnection();
 
-        const record = await getTemplateCoordinates(
-            db,
-            templateId,
-            electionId
+        const [ballots] = await db.execute(
+            `SELECT status FROM issued_ballots
+             WHERE ballot_id = ? AND election_id = ? AND template_id = ?
+             LIMIT 1`,
+            [qr.ballot_id, electionId, templateId]
         );
 
-        if (!record) {
-            return res.status(404).json({
-                message: "Template not found for this election."
+        if (!ballots.length) return fail(422, "Unregistered ballot.");
+
+        const ballotStatus = ballots[0].status;
+
+        if (!["ISSUED", "CAST"].includes(ballotStatus)) {
+            return fail(409, "Ballot is not eligible for scanning.", {
+                status: ballotStatus,
+                duplicate: ballotStatus === "COUNTED"
             });
         }
 
+        const record = await getTemplateCoordinates(db, templateId, electionId);
+
+        if (!record) return fail(404, "Ballot template not found.");
         if (record.template.paper_size !== "A5") {
-            return res.status(422).json({
-                message: "Scanner requires an A5 template."
-            });
+            return fail(422, "OMR scanner currently requires an A5 template.");
         }
-
         if (!record.coordinates.length) {
-            return res.status(422).json({
-                message: "Template has no saved OMR coordinates."
-            });
+            return fail(422, "No saved bubble coordinates found.");
         }
 
-        // Read image as grayscale.
         const { data, info } = await sharp(req.file.path)
             .rotate()
             .grayscale()
             .raw()
             .toBuffer({ resolveWithObject: true });
 
-        if (
-            info.width !== EXPECTED_WIDTH ||
-            info.height !== EXPECTED_HEIGHT
-        ) {
-            return res.status(422).json({
-                message:
-                    `Expected ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT}px ` +
-                    `but received ${info.width}x${info.height}px. ` +
-                    "No votes recorded."
-            });
+        const image = {
+            data,
+            width: info.width,
+            height: info.height
+        };
+
+        let marks, H;
+
+        try {
+            marks = await findMarkers(req.file.path, info.width, info.height);
+
+            if (marks.length !== 4) {
+                throw new Error("Four registration markers are required.");
+            }
+
+            H = homography([
+                { x: mm(9.5), y: mm(7.5) },
+                { x: mm(200.5), y: mm(7.5) },
+                { x: mm(9.5), y: mm(140.5) },
+                { x: mm(200.5), y: mm(140.5) }
+            ], marks);
+        } catch (error) {
+            return fail(422, "Alignment failed. Retake the photo. " + error.message);
         }
 
         const grouped = new Map();
+        const seen = new Set();
 
-        // =====================================
-        // READ EVERY SAVED BUBBLE
-        // =====================================
         for (const coord of record.coordinates) {
-            const x = Number(coord.x_pos);
-            const y = Number(coord.y_pos);
-            const w = Number(coord.width);
-            const h = Number(coord.height);
-
-            if (
-                ![x, y, w, h].every(Number.isInteger) ||
-                x < 0 ||
-                y < 0 ||
-                w < 3 ||
-                h < 3 ||
-                x + w > info.width ||
-                y + h > info.height
-            ) {
-                return res.status(422).json({
-                    message:
-                        `Invalid coordinates for candidate ` +
-                        `${coord.candidate_id}. No votes recorded.`
-                });
-            }
-
-            const left = x + Math.floor(w * 0.28);
-            const top = y + Math.floor(h * 0.28);
-            const right = x + Math.ceil(w * 0.72);
-            const bottom = y + Math.ceil(h * 0.72);
-
-            let dark = 0;
-            let total = 0;
-
-            for (let yy = top; yy < bottom; yy++) {
-                for (let xx = left; xx < right; xx++) {
-                    if (
-                        data[yy * info.width + xx] <
-                        DARK_LIMIT
-                    ) {
-                        dark++;
-                    }
-
-                    total++;
-                }
-            }
-
-            const percentage = total
-                ? (dark / total) * 100
-                : 0;
-
+            const candidateId = Number(coord.candidate_id);
             const positionId = Number(coord.position_id);
+            const maxSelection = Number(coord.max_selection);
+
+            if (!validId(candidateId) || !validId(positionId) ||
+                !validId(maxSelection) || seen.has(candidateId)) {
+                return fail(422, "Invalid or duplicate saved coordinates.");
+            }
+
+            seen.add(candidateId);
+
+            let measurement;
+            try {
+                measurement = measure(image, H, coord, COUNTING_SENSITIVITY);
+            } catch (error) {
+                return fail(422, "Bubble alignment failed. " + error.message);
+            }
 
             if (!grouped.has(positionId)) {
                 grouped.set(positionId, {
                     position_id: positionId,
                     position_name: coord.position_name,
-                    max_selection:
-                        Number(coord.max_selection) || 1,
+                    max_selection: maxSelection,
                     candidates: []
                 });
             }
 
-            grouped.get(positionId).candidates.push({
-                candidate_id: Number(coord.candidate_id),
+            const position = grouped.get(positionId);
+
+            if (position.max_selection !== maxSelection) {
+                return fail(422, "Inconsistent maximum selections.");
+            }
+
+            const unclear = !measurement.selected &&
+                measurement.average >= 9 &&
+                measurement.average < 18 &&
+                measurement.marked >= 0.12;
+
+            position.candidates.push({
+                candidate_id: candidateId,
                 name: coord.candidate_name,
-                filled: percentage >= MIN_FILL_PERCENT,
-                fill_intensity:
-                    Math.round(percentage * 100) / 100
+                filled: measurement.selected,
+                unclear,
+                fill_intensity: Math.round(measurement.marked * 10000) / 100,
+                contrast: Math.round(measurement.average * 100) / 100
             });
         }
 
-        // =====================================
-        // CHECK OVERVOTES
-        // =====================================
-        const positions = [...grouped.values()].map(
-            position => {
-                const marked = position.candidates.filter(
-                    candidate => candidate.filled
-                );
+        const positions = [...grouped.values()].map(position => {
+            const markedCandidates = position.candidates.filter(c => c.filled);
+            const marked = markedCandidates.length;
+            const overvoted = marked > position.max_selection;
+            const unclear = position.candidates.some(c => c.unclear);
 
-                const overvoted =
-                    marked.length > position.max_selection;
+            let result = "BLANK";
+            if (overvoted) result = "SKIPPED_OVERVOTE";
+            else if (unclear) result = "SKIPPED_UNCLEAR";
+            else if (marked > 0) result = "COUNTED";
 
-                return {
-                    ...position,
-                    marked: marked.length,
-                    overvoted,
-                    recorded: overvoted ? 0 : marked.length
-                };
-            }
-        );
-
-        if (positions.some(position => position.overvoted)) {
-            return res.status(422).json({
-                message:
-                    "Overvote detected. No votes recorded. " +
-                    "Review the ballot manually.",
-                positions
-            });
-        }
-
-        // =====================================
-        // SAVE BALLOT AND VOTES ATOMICALLY
-        // =====================================
-        await db.beginTransaction();
-        transactionStarted = true;
-
-        const ballotId = crypto.randomUUID();
-        const scannerUserId = req.user?.id ?? null;
-
-        await db.execute(
-            `INSERT INTO scanned_ballots
-             (
-                ballot_id,
-                election_id,
-                scanner_user_id,
-                ballot_image_path
-             )
-             VALUES (?, ?, ?, ?)`,
-            [
-                ballotId,
-                electionId,
-                scannerUserId,
-                req.file.path
-            ]
-        );
-
-        let votesRecorded = 0;
-
-        for (const position of positions) {
-            for (
-                const candidate of position.candidates.filter(
-                    candidate => candidate.filled
-                )
-            ) {
-                await db.execute(
-                    `INSERT INTO ballot_votes
-                     (
-                        ballot_id,
-                        candidate_id,
-                        position_id,
-                        fill_intensity
-                     )
-                     VALUES (?, ?, ?, ?)`,
-                    [
-                        ballotId,
-                        candidate.candidate_id,
-                        position.position_id,
-                        candidate.fill_intensity
-                    ]
-                );
-
-                votesRecorded++;
-            }
-        }
-
-        await db.commit();
-        transactionStarted = false;
-
-        return res.status(201).json({
-            message: "Ballot recorded successfully",
-            ballot_id: ballotId,
-            votes_recorded: votesRecorded,
-            positions
+            return {
+                ...position,
+                marked,
+                overvoted,
+                unclear,
+                result,
+                recorded: result === "COUNTED" ? marked : 0
+            };
         });
 
-    } catch (error) {
-        if (transactionStarted && db) {
+        const votes = positions.flatMap(position =>
+            position.result === "COUNTED"
+                ? position.candidates
+                    .filter(candidate => candidate.filled)
+                    .map(candidate => ({
+                        candidate_id: candidate.candidate_id,
+                        position_id: position.position_id,
+                        fill_intensity: candidate.fill_intensity
+                    }))
+                : []
+        );
+
+        if (counting) {
+            await db.beginTransaction();
+
             try {
-                await db.rollback();
-            } catch (rollbackError) {
-                console.error(
-                    "OMR rollback failed:",
-                    rollbackError
+                const [locked] = await db.execute(
+                    `SELECT status FROM issued_ballots
+                     WHERE ballot_id = ? AND election_id = ? AND template_id = ?
+                     FOR UPDATE`,
+                    [qr.ballot_id, electionId, templateId]
                 );
+
+                if (!locked.length || !["ISSUED", "CAST"].includes(locked[0].status)) {
+                    await db.rollback();
+                    return fail(409, "Duplicate, void or unavailable ballot.", {
+                        duplicate: locked[0]?.status === "COUNTED"
+                    });
+                }
+
+                const [elections] = await db.execute(
+                    `SELECT scanning_open, is_current, is_active, archived_at
+                     FROM elections WHERE election_id = ? LIMIT 1`,
+                    [electionId]
+                );
+
+                const election = elections[0];
+
+                if (!election || Number(election.scanning_open) !== 1 ||
+                    Number(election.is_current) !== 1 ||
+                    Number(election.is_active) !== 1 || election.archived_at) {
+                    await db.rollback();
+                    return fail(403, "Election scanning is closed. No votes saved.");
+                }
+
+                const [existing] = await db.execute(
+                    "SELECT ballot_id FROM scanned_ballots WHERE ballot_id = ? LIMIT 1",
+                    [qr.ballot_id]
+                );
+
+                if (existing.length) {
+                    await db.rollback();
+                    return fail(409, "This ballot has already been scanned.", {
+                        duplicate: true
+                    });
+                }
+
+                await db.execute(
+                    `INSERT INTO scanned_ballots
+                     (ballot_id, election_id, scanner_user_id)
+                     VALUES (?, ?, ?)`,
+                    [qr.ballot_id, electionId, req.user.id]
+                );
+
+                for (const vote of votes) {
+                    await db.execute(
+                        `INSERT INTO ballot_votes
+                         (ballot_id, candidate_id, position_id, fill_intensity)
+                         VALUES (?, ?, ?, ?)`,
+                        [
+                            qr.ballot_id,
+                            vote.candidate_id,
+                            vote.position_id,
+                            vote.fill_intensity
+                        ]
+                    );
+                }
+
+                await db.execute(
+                    `UPDATE issued_ballots
+                     SET status = 'COUNTED',
+                         cast_at = COALESCE(cast_at, NOW()),
+                         counted_at = NOW()
+                     WHERE ballot_id = ?`,
+                    [qr.ballot_id]
+                );
+
+                await db.commit();
+            } catch (error) {
+                await db.rollback();
+                throw error;
             }
         }
 
-        console.error("OMR processing error:", error);
-
-        return res.status(500).json({
-            message:
-                "Scan failed. Check server logs and database " +
-                "records before retrying."
+        return res.status(200).json({
+            success: true,
+            valid: true,
+            preview_only: !counting,
+            counted: counting,
+            election_id: electionId,
+            template_id: templateId,
+            ballot_id: qr.ballot_id,
+            status: counting ? "COUNTED" : ballotStatus,
+            paper_size: record.template.paper_size,
+            source: { width: info.width, height: info.height },
+            markers_detected: marks.length,
+            sensitivity: "Balanced",
+            selected_bubbles: positions.reduce((n, p) => n + p.marked, 0),
+            overvotes: positions.filter(p => p.overvoted).length,
+            skipped_positions: positions.filter(p => p.result.startsWith("SKIPPED")).length,
+            saved_votes: counting ? votes.length : 0,
+            positions,
+            message: counting
+                ? `Ballot counted. ${votes.length} votes saved.`
+                : `Preview complete. ${votes.length} valid votes detected. Nothing saved.`
         });
-
+    } catch (error) {
+        console.error("OMR processing error:", error);
+        return fail(500, "OMR processing failed. Check backend logs.");
     } finally {
-        if (db) {
-            db.release();
+        if (db) db.release();
+
+        if (req.file?.path) {
+            try {
+                await require("fs/promises").unlink(req.file.path);
+            } catch (error) {
+                console.error("OMR cleanup error:", error.message);
+            }
         }
     }
 };
 
-// =====================================
+// ============================================================
 // LIVE TALLIES
-// =====================================
+// ============================================================
+
 exports.getLiveTallies = async (req, res) => {
     try {
         const electionId = Number(
@@ -338,7 +1178,8 @@ exports.getLiveTallies = async (req, res) => {
 
         if (!validId(electionId)) {
             return res.status(400).json({
-                message: "Invalid election ID"
+                message:
+                    "Invalid election ID."
             });
         }
 
@@ -346,8 +1187,12 @@ exports.getLiveTallies = async (req, res) => {
             `SELECT *
              FROM v_live_tallies
              WHERE election_id = ?
-             ORDER BY position_id, total_votes DESC`,
-            [electionId]
+             ORDER BY
+                position_id,
+                total_votes DESC`,
+            [
+                electionId
+            ]
         );
 
         return res.status(200).json({
@@ -355,10 +1200,14 @@ exports.getLiveTallies = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Live tallies error:", error);
+        console.error(
+            "Live tallies error:",
+            error
+        );
 
         return res.status(500).json({
-            message: "Failed to load live tallies"
+            message:
+                "Failed to load live tallies."
         });
     }
 };

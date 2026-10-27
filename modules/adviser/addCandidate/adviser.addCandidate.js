@@ -63,12 +63,21 @@ async function getCurrentElection() {
 
 // Candidate changes are not allowed once voting is completed.
 function canManageCandidates(election) {
+    if (!election) return false;
+
+    const status = String(election.status || "")
+        .trim()
+        .toLowerCase();
+
     return (
-        election &&
         election.archived_at === null &&
-        election.status !== "completed"
+        Number(election.is_current) === 1 &&
+        Number(election.is_active) === 0 &&
+        status !== "active" &&
+        status !== "completed"
     );
 }
+
 
 function serverError(res, label, error) {
     console.error(label, error);
@@ -144,8 +153,7 @@ exports.addCandidate = async (req, res) => {
 
         if (!canManageCandidates(election)) {
             return res.status(409).json({
-                message:
-                    "Cannot add candidates to a completed or archived election"
+                message: "Candidate management is locked while voting is in progress or the election has ended."
             });
         }
 

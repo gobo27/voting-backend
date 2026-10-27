@@ -3,12 +3,24 @@ const express = require('express');
 //CROSS ORIGIN RESOURCE SHARING
 const cors = require('cors');
 //ENVIRONMENT VARIABLES
-require('dotenv').config({path: require('path').join(__dirname, '.env')});
+const path = require("path");
+
+const envResult = require("dotenv").config({
+    path: path.join(__dirname, ".env")
+});
+
+if (envResult.error) {
+    console.error("ENV LOAD ERROR:", envResult.error.message);
+}
+
+console.log(
+    "OMR COUNTING STATUS:",
+    JSON.stringify(process.env.OMR_COUNTING_ENABLED)
+);
 //DATABASE CONNECTION
 const db=require('./config/db.js');
 //ROUTES
 const routes = require('./routes/index.js');
-
 //UTILIZATION OF EXPRESS
 const app = express();
 app.use(cors());

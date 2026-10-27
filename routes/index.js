@@ -9,7 +9,9 @@ const candidateRoutes = require("../modules/adviser/addCandidate/adviser.addCand
 const positionRoutes = require("../modules/adviser/position/addPosition.router");
 const electionControlRoutes = require("../modules/adviser/controller/electionControl.router");
 const ballotRoutes = require("../modules/Committee/creatingballot/creatingballot.router");
+const ballotQRRoutes = require("../modules/Committee/ballotQR/ballotQR.router");
 const omrRoutes = require("../modules/Committee/OMR/omr.router");
+const ballotReceivingRoutes = require("../modules/Committee/ballotReceiving/ballotReceiving.router");
 const dashboardRoutes = require("../modules/dashboard/dashboard.router");
 const electionArchiveRoutes = require("../modules/super admin/electionArchive/electionArchive.router");
 
@@ -20,7 +22,9 @@ router.use("/candidates", candidateRoutes);
 router.use("/positions", positionRoutes);
 router.use("/election", electionControlRoutes);
 router.use("/ballots", ballotRoutes);
+router.use("/ballots/qr", ballotQRRoutes);
 router.use("/omr", omrRoutes);
+router.use("/ballots",ballotReceivingRoutes);
 router.use("/dashboard", dashboardRoutes);
 router.use("/election_archive", electionArchiveRoutes);
 
