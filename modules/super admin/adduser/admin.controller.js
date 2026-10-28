@@ -276,7 +276,11 @@ exports.updateAccount = async (req, res) => {
 };
 
 // DELETE ACCOUNT
+
+ // DELETE ACCOUNT
 exports.deleteAccount = async (req, res) => {
+    let conn;
+
     try {
         const { id } = req.params;
 
@@ -286,29 +290,103 @@ exports.deleteAccount = async (req, res) => {
             });
         }
 
-        // Protect Super Admin accounts.
-        const [result] = await db.execute(
+        // Adjust these fields if your JWT uses different names.
+        const loggedInId =
+            req.user?.id ??
+            req.user?.user_id;
+
+        if (!validId(loggedInId)) {
+            return res.status(403).json({
+                message: "Unable to verify your account identity."
+            });
+        }
+
+        if (Number(id) === Number(loggedInId)) {
+            return res.status(403).json({
+                message: "You cannot delete your own account."
+            });
+        }
+
+        conn = await db.getConnection();
+        await conn.beginTransaction();
+
+        const [target] = await conn.execute(
+            `SELECT id, role
+             FROM users
+             WHERE id = ?
+             FOR UPDATE`,
+            [id]
+        );
+
+        if (!target.length) {
+            await conn.rollback();
+            return res.status(404).json({
+                message: "Account not found."
+            });
+        }
+
+        if (!ALLOWED_ROLES.includes(target[0].role)) {
+            await conn.rollback();
+            return res.status(403).json({
+                message: "This account cannot be deleted."
+            });
+        }
+
+        if (target[0].role === "super_admin") {
+            // Lock the super admin rows to prevent
+            // simultaneous deletion of the last admin.
+            const [admins] = await conn.execute(
+                `SELECT id
+                 FROM users
+                 WHERE role = 'super_admin'
+                 ORDER BY id
+                 FOR UPDATE`
+            );
+
+            if (admins.length <= 1) {
+                await conn.rollback();
+                return res.status(403).json({
+                    message: "Cannot delete the last Super Admin."
+                });
+            }
+        }
+
+        const [result] = await conn.execute(
             `DELETE FROM users
              WHERE id = ?
-             AND role IN ('adviser', 'committee')`,
+             AND role IN ('adviser', 'committee', 'super_admin')`,
             [id]
         );
 
         if (!result.affectedRows) {
+            await conn.rollback();
             return res.status(404).json({
-                message: "Account not found or protected."
+                message: "Account not found."
             });
         }
+
+        await conn.commit();
 
         return res.json({
             message: "Account deleted successfully."
         });
 
     } catch (error) {
+        if (conn) {
+            try {
+                await conn.rollback();
+            } catch (rollbackError) {
+                console.error("ROLLBACK ERROR:", rollbackError);
+            }
+        }
+
         console.error("DELETE ACCOUNT ERROR:", error);
 
         return res.status(500).json({
             message: "Unable to delete account."
         });
+
+    } finally {
+        if (conn) conn.release();
     }
 };
