@@ -3,75 +3,41 @@
 
 const sharp = require("sharp");
 const jsQR = require("jsqr");
+const fs = require("fs/promises");
 const pool = require("../../../config/db");
 
 const DPI = 300;
-
 const PAPER_WIDTH = 2480;
 const PAPER_HEIGHT = 1754;
-
 const COUNTING_SENSITIVITY = 2;
-
 const mm = value => value * DPI / 25.4;
 
-// ============================================================
 // COMMON HELPERS
-// ============================================================
 
 function validId(value) {
     const number = Number(value);
-
-    return (
-        Number.isSafeInteger(number) &&
-        number > 0
-    );
+    return Number.isSafeInteger(number) && number > 0;
 }
 
 function median(values) {
-    if (!values.length) {
-        return 255;
-    }
-
-    const sorted = [...values].sort(
-        (a, b) => a - b
-    );
-
-    const middle = Math.floor(
-        sorted.length / 2
-    );
-
-    if (sorted.length % 2) {
-        return sorted[middle];
-    }
-
-    return (
-        sorted[middle - 1] +
-        sorted[middle]
-    ) / 2;
+    if (!values.length) return 255;
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2
+        ? sorted[middle]
+        : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-// ============================================================
 // QR PARSING
-// ============================================================
 
 function parseQR(qrData) {
-    const parts = String(qrData || "")
-        .trim()
-        .split("|");
+    const parts = String(qrData || "").trim().split("|");
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-    const uuidPattern =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-    if (
-        parts.length !== 4 ||
-        parts[0] !== "CV1" ||
-        !validId(parts[1]) ||
-        !uuidPattern.test(parts[2]) ||
-        !validId(parts[3])
-    ) {
-        throw new Error(
-            "Invalid CampusVote ballot QR code."
-        );
+    if (parts.length !== 4 || parts[0] !== "CV1" ||
+        !validId(parts[1]) || !uuidPattern.test(parts[2]) ||
+        !validId(parts[3])) {
+        throw new Error("Invalid CampusVote ballot QR code.");
     }
 
     return {
@@ -81,43 +47,26 @@ function parseQR(qrData) {
     };
 }
 
-// ============================================================
-// READ QR FROM IMAGE
-// ============================================================
+// QR IMAGE DETECTION
 
 async function readBallotQR(imagePath) {
     const { data, info } = await sharp(imagePath)
         .rotate()
         .ensureAlpha()
         .raw()
-        .toBuffer({
-            resolveWithObject: true
-        });
+        .toBuffer({ resolveWithObject: true });
 
     let result = jsQR(
         new Uint8ClampedArray(data),
         info.width,
         info.height,
-        {
-            inversionAttempts: "attemptBoth"
-        }
+        { inversionAttempts: "attemptBoth" }
     );
 
-    // Retry the upper-right area if full-image
-    // QR detection fails.
-
     if (!result) {
-        const cropX = Math.floor(
-            info.width * 0.65
-        );
-
-        const cropWidth =
-            info.width - cropX;
-
-        const cropHeight = Math.max(
-            1,
-            Math.floor(info.height * 0.40)
-        );
+        const cropX = Math.floor(info.width * 0.65);
+        const cropWidth = info.width - cropX;
+        const cropHeight = Math.max(1, Math.floor(info.height * 0.40));
 
         const crop = await sharp(imagePath)
             .rotate()
@@ -129,87 +78,50 @@ async function readBallotQR(imagePath) {
             })
             .ensureAlpha()
             .raw()
-            .toBuffer({
-                resolveWithObject: true
-            });
+            .toBuffer({ resolveWithObject: true });
 
         result = jsQR(
             new Uint8ClampedArray(crop.data),
             crop.info.width,
             crop.info.height,
-            {
-                inversionAttempts: "attemptBoth"
-            }
+            { inversionAttempts: "attemptBoth" }
         );
     }
 
     if (!result) {
-        throw new Error(
-            "QR code not detected. No votes recorded."
-        );
+        throw new Error("QR code not detected. No votes recorded.");
     }
 
     return parseQR(result.data);
 }
 
-// ============================================================
-// LOAD SAVED BALLOT TEMPLATE
-// ============================================================
+// BALLOT TEMPLATE
 
-async function getTemplateCoordinates(
-    db,
-    templateId,
-    electionId
-) {
+async function getTemplateCoordinates(db, templateId, electionId) {
     const [templates] = await db.execute(
-        `SELECT
-            template_id,
-            election_id,
-            paper_size
+        `SELECT template_id, election_id, paper_size
          FROM ballot_templates
-         WHERE template_id = ?
-           AND election_id = ?
+         WHERE template_id = ? AND election_id = ?
          LIMIT 1`,
-        [
-            templateId,
-            electionId
-        ]
+        [templateId, electionId]
     );
 
-    if (!templates.length) {
-        return null;
-    }
+    if (!templates.length) return null;
 
     const [coordinates] = await db.execute(
         `SELECT
-            g.coord_id,
-            g.candidate_id,
-            g.bubble_code,
-            g.x_pos,
-            g.y_pos,
-            g.width,
-            g.height,
-            c.name AS candidate_name,
-            c.position_id,
-            p.title AS position_name,
-            p.max_selection
+            g.coord_id, g.candidate_id, g.bubble_code,
+            g.x_pos, g.y_pos, g.width, g.height,
+            c.name AS candidate_name, c.position_id,
+            p.title AS position_name, p.max_selection
          FROM omr_grid_coordinates g
-         JOIN candidates c
-           ON c.candidate_id = g.candidate_id
-         JOIN positions p
-           ON p.position_id = c.position_id
+         JOIN candidates c ON c.candidate_id = g.candidate_id
+         JOIN positions p ON p.position_id = c.position_id
          WHERE g.template_id = ?
            AND c.election_id = ?
            AND p.election_id = ?
-         ORDER BY
-            p.position_id,
-            g.y_pos,
-            g.x_pos`,
-        [
-            templateId,
-            electionId,
-            electionId
-        ]
+         ORDER BY p.position_id, g.y_pos, g.x_pos`,
+        [templateId, electionId, electionId]
     );
 
     return {
@@ -218,43 +130,19 @@ async function getTemplateCoordinates(
     };
 }
 
-// ============================================================
-// FIND FOUR REGISTRATION MARKERS
-// ============================================================
+// REGISTRATION MARKERS
 
-async function findMarkers(
-    imagePath,
-    originalWidth,
-    originalHeight
-) {
-    const scale = Math.min(
-        1,
-        1100 / Math.max(
-            originalWidth,
-            originalHeight
-        )
-    );
-
-    const w = Math.max(
-        1,
-        Math.round(originalWidth * scale)
-    );
-
-    const h = Math.max(
-        1,
-        Math.round(originalHeight * scale)
-    );
+async function findMarkers(imagePath, originalWidth, originalHeight) {
+    const scale = Math.min(1, 1100 / Math.max(originalWidth, originalHeight));
+    const w = Math.max(1, Math.round(originalWidth * scale));
+    const h = Math.max(1, Math.round(originalHeight * scale));
 
     const { data } = await sharp(imagePath)
         .rotate()
-        .resize(w, h, {
-            fit: "fill"
-        })
+        .resize(w, h, { fit: "fill" })
         .grayscale()
         .raw()
-        .toBuffer({
-            resolveWithObject: true
-        });
+        .toBuffer({ resolveWithObject: true });
 
     const mask = new Uint8Array(w * h);
     const seen = new Uint8Array(w * h);
@@ -273,37 +161,19 @@ async function findMarkers(
     const found = [];
 
     for (const [cx, cy] of corners) {
-        const x0 = cx === 0
-            ? 0
-            : Math.floor(w * 0.66);
-
-        const x1 = cx === 0
-            ? Math.ceil(w * 0.34)
-            : w;
-
-        const y0 = cy === 0
-            ? 0
-            : Math.floor(h * 0.66);
-
-        const y1 = cy === 0
-            ? Math.ceil(h * 0.34)
-            : h;
+        const x0 = cx === 0 ? 0 : Math.floor(w * 0.66);
+        const x1 = cx === 0 ? Math.ceil(w * 0.34) : w;
+        const y0 = cy === 0 ? 0 : Math.floor(h * 0.66);
+        const y1 = cy === 0 ? Math.ceil(h * 0.34) : h;
 
         let best = null;
 
         for (let yy = y0; yy < y1; yy++) {
             for (let xx = x0; xx < x1; xx++) {
                 const start = yy * w + xx;
-
-                if (
-                    !mask[start] ||
-                    seen[start]
-                ) {
-                    continue;
-                }
+                if (!mask[start] || seen[start]) continue;
 
                 const stack = [start];
-
                 seen[start] = 1;
 
                 let area = 0;
@@ -316,12 +186,10 @@ async function findMarkers(
 
                 while (stack.length) {
                     const n = stack.pop();
-
                     const px = n % w;
                     const py = Math.floor(n / w);
 
                     area++;
-
                     sx += px;
                     sy += py;
 
@@ -332,11 +200,7 @@ async function findMarkers(
 
                     if (px > x0) {
                         const q = n - 1;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
+                        if (mask[q] && !seen[q]) {
                             seen[q] = 1;
                             stack.push(q);
                         }
@@ -344,11 +208,7 @@ async function findMarkers(
 
                     if (px + 1 < x1) {
                         const q = n + 1;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
+                        if (mask[q] && !seen[q]) {
                             seen[q] = 1;
                             stack.push(q);
                         }
@@ -356,11 +216,7 @@ async function findMarkers(
 
                     if (py > y0) {
                         const q = n - w;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
+                        if (mask[q] && !seen[q]) {
                             seen[q] = 1;
                             stack.push(q);
                         }
@@ -368,11 +224,7 @@ async function findMarkers(
 
                     if (py + 1 < y1) {
                         const q = n + w;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
+                        if (mask[q] && !seen[q]) {
                             seen[q] = 1;
                             stack.push(q);
                         }
@@ -381,38 +233,21 @@ async function findMarkers(
 
                 const bw = maxX - minX + 1;
                 const bh = maxY - minY + 1;
-
                 const ratio = bw / bh;
                 const density = area / (bw * bh);
 
-                if (
-                    area < 8 ||
-                    bw < 3 ||
-                    bh < 3 ||
-                    bw > w * 0.08 ||
-                    bh > h * 0.08 ||
-                    ratio < 0.6 ||
-                    ratio > 1.65 ||
-                    density < 0.72
-                ) {
+                if (area < 8 || bw < 3 || bh < 3 ||
+                    bw > w * 0.08 || bh > h * 0.08 ||
+                    ratio < 0.6 || ratio > 1.65 || density < 0.72) {
                     continue;
                 }
 
                 const mx = sx / area;
                 const my = sy / area;
+                const distance = Math.hypot(mx - cx, my - cy);
+                const score = area / (1 + distance);
 
-                const distance = Math.hypot(
-                    mx - cx,
-                    my - cy
-                );
-
-                const score =
-                    area / (1 + distance);
-
-                if (
-                    !best ||
-                    score > best.score
-                ) {
+                if (!best || score > best.score) {
                     best = {
                         x: mx / scale,
                         y: my / scale,
@@ -424,8 +259,7 @@ async function findMarkers(
 
         if (!best) {
             throw new Error(
-                "Four registration squares not detected. " +
-                "Keep all four corners visible."
+                "Four registration squares not detected. Keep all four corners visible."
             );
         }
 
@@ -433,73 +267,38 @@ async function findMarkers(
     }
 
     const [tl, tr, bl, br] = found;
+    const topWidth = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+    const bottomWidth = Math.hypot(br.x - bl.x, br.y - bl.y);
+    const leftHeight = Math.hypot(bl.x - tl.x, bl.y - tl.y);
+    const rightHeight = Math.hypot(br.x - tr.x, br.y - tr.y);
 
-    const topWidth = Math.hypot(
-        tr.x - tl.x,
-        tr.y - tl.y
-    );
-
-    const bottomWidth = Math.hypot(
-        br.x - bl.x,
-        br.y - bl.y
-    );
-
-    const leftHeight = Math.hypot(
-        bl.x - tl.x,
-        bl.y - tl.y
-    );
-
-    const rightHeight = Math.hypot(
-        br.x - tr.x,
-        br.y - tr.y
-    );
-
-    if (
-        Math.min(topWidth, bottomWidth) <
-        originalWidth * 0.35 ||
-        Math.min(leftHeight, rightHeight) <
-        originalHeight * 0.35
-    ) {
+    if (Math.min(topWidth, bottomWidth) < originalWidth * 0.35 ||
+        Math.min(leftHeight, rightHeight) < originalHeight * 0.35) {
         throw new Error(
-            "Registration markers are too close. " +
-            "Check image crop and alignment."
+            "Registration markers are too close. Check image crop and alignment."
         );
     }
 
     return found;
 }
 
-// ============================================================
-// SOLVE 8 EQUATIONS
-// ============================================================
+// HOMOGRAPHY
 
 function solve8(A, b) {
     for (let i = 0; i < 8; i++) {
         let pivot = i;
 
         for (let j = i + 1; j < 8; j++) {
-            if (
-                Math.abs(A[j][i]) >
-                Math.abs(A[pivot][i])
-            ) {
+            if (Math.abs(A[j][i]) > Math.abs(A[pivot][i])) {
                 pivot = j;
             }
         }
 
-        [A[i], A[pivot]] = [
-            A[pivot],
-            A[i]
-        ];
-
-        [b[i], b[pivot]] = [
-            b[pivot],
-            b[i]
-        ];
+        [A[i], A[pivot]] = [A[pivot], A[i]];
+        [b[i], b[pivot]] = [b[pivot], b[i]];
 
         if (Math.abs(A[i][i]) < 1e-10) {
-            throw new Error(
-                "Invalid marker geometry."
-            );
+            throw new Error("Invalid marker geometry.");
         }
 
         const divisor = A[i][i];
@@ -526,147 +325,74 @@ function solve8(A, b) {
     return b;
 }
 
-// ============================================================
-// PERSPECTIVE HOMOGRAPHY
-// ============================================================
-
 function homography(from, to) {
     const A = [];
     const b = [];
 
     for (let i = 0; i < 4; i++) {
         const { x, y } = from[i];
+        const { x: u, y: v } = to[i];
 
-        const {
-            x: u,
-            y: v
-        } = to[i];
-
-        A.push([
-            x, y, 1,
-            0, 0, 0,
-            -u * x, -u * y
-        ]);
-
+        A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]);
         b.push(u);
 
-        A.push([
-            0, 0, 0,
-            x, y, 1,
-            -v * x, -v * y
-        ]);
-
+        A.push([0, 0, 0, x, y, 1, -v * x, -v * y]);
         b.push(v);
     }
 
     return solve8(A, b);
 }
 
-// ============================================================
-// PROJECT SAVED COORDINATES ONTO SCANNED IMAGE
-// ============================================================
-
 function project(H, x, y) {
-    const d =
-        H[6] * x +
-        H[7] * y +
-        1;
-
-    if (Math.abs(d) < 1e-10) {
-        return null;
-    }
+    const d = H[6] * x + H[7] * y + 1;
+    if (Math.abs(d) < 1e-10) return null;
 
     return {
-        x: (
-            H[0] * x +
-            H[1] * y +
-            H[2]
-        ) / d,
-
-        y: (
-            H[3] * x +
-            H[4] * y +
-            H[5]
-        ) / d
+        x: (H[0] * x + H[1] * y + H[2]) / d,
+        y: (H[3] * x + H[4] * y + H[5]) / d
     };
 }
 
-// ============================================================
-// SAMPLE PIXEL BRIGHTNESS
-// ============================================================
+// PIXEL SAMPLING
 
 function sample(image, H, x, y) {
     const point = project(H, x, y);
-
-    if (!point) {
-        return null;
-    }
+    if (!point) return null;
 
     const px = Math.round(point.x);
     const py = Math.round(point.y);
 
-    if (
-        px < 0 ||
-        py < 0 ||
-        px >= image.width ||
-        py >= image.height
-    ) {
+    if (px < 0 || py < 0 ||
+        px >= image.width || py >= image.height) {
         return null;
     }
 
-    return image.data[
-        py * image.width + px
-    ];
+    return image.data[py * image.width + px];
 }
 
-// ============================================================
-// ADAPTIVE SHADE DETECTION
-// ============================================================
+// SHADE DETECTION
 
-function measure(
-    image,
-    H,
-    coordinate,
-    sensitivity
-) {
+function measure(image, H, coordinate, sensitivity) {
     const x = Number(coordinate.x_pos);
     const y = Number(coordinate.y_pos);
     const w = Number(coordinate.width);
     const h = Number(coordinate.height);
 
-    if (
-        ![x, y, w, h].every(Number.isFinite) ||
-        w <= 0 ||
-        h <= 0 ||
-        x < 0 ||
-        y < 0 ||
-        x + w > PAPER_WIDTH ||
-        y + h > PAPER_HEIGHT
-    ) {
-        throw new Error(
-            "Invalid saved bubble coordinates."
-        );
+    if (![x, y, w, h].every(Number.isFinite) ||
+        w <= 0 || h <= 0 || x < 0 || y < 0 ||
+        x + w > PAPER_WIDTH || y + h > PAPER_HEIGHT) {
+        throw new Error("Invalid saved bubble coordinates.");
     }
 
     const cx = x + w / 2;
     const cy = y + h / 2;
-
     const inside = [];
     const paper = [];
 
-    // Sample the center of the bubble.
-    // Avoid its printed circular outline.
-
     for (let j = -12; j <= 12; j++) {
         for (let i = -12; i <= 12; i++) {
-            const r = Math.hypot(
-                i / 12,
-                j / 12
-            );
-
-            if (r > 0.60) {
-                continue;
-            }
+            const r = Math.hypot(i / 12, j / 12);
+            if (r > 0.60) continue;
 
             const value = sample(
                 image,
@@ -675,28 +401,14 @@ function measure(
                 cy + (j / 12) * h * 0.42
             );
 
-            if (value !== null) {
-                inside.push(value);
-            }
+            if (value !== null) inside.push(value);
         }
     }
 
-    // Sample surrounding paper to calculate
-    // local background brightness.
-
     for (let j = -16; j <= 16; j++) {
         for (let i = -16; i <= 16; i++) {
-            const r = Math.hypot(
-                i / 16,
-                j / 16
-            );
-
-            if (
-                r < 0.75 ||
-                r > 1
-            ) {
-                continue;
-            }
+            const r = Math.hypot(i / 16, j / 16);
+            if (r < 0.75 || r > 1) continue;
 
             const value = sample(
                 image,
@@ -705,44 +417,29 @@ function measure(
                 cy + (j / 16) * h * 0.95
             );
 
-            if (value !== null) {
-                paper.push(value);
-            }
+            if (value !== null) paper.push(value);
         }
     }
 
-    if (
-        inside.length < 50 ||
-        paper.length < 12
-    ) {
+    if (inside.length < 50 || paper.length < 12) {
         throw new Error(
-            "Insufficient bubble samples. " +
-            "Check image alignment."
+            "Insufficient bubble samples. Check image alignment."
         );
     }
 
-    const sortedPaper = [...paper].sort(
-        (a, b) => a - b
-    );
-
+    const sortedPaper = [...paper].sort((a, b) => a - b);
     const brightPaper = sortedPaper.slice(
         Math.floor(sortedPaper.length * 0.5)
     );
-
     const baseline = median(brightPaper);
 
     const differences = inside.map(
-        value => Math.max(
-            0,
-            baseline - value
-        )
+        value => Math.max(0, baseline - value)
     );
 
-    const average =
-        differences.reduce(
-            (sum, value) => sum + value,
-            0
-        ) / differences.length;
+    const average = differences.reduce(
+        (sum, value) => sum + value, 0
+    ) / differences.length;
 
     const settings = {
         1: {
@@ -750,13 +447,11 @@ function measure(
             minimum: 21,
             requiredMarked: 0.32
         },
-
         2: {
             contrast: 21,
             minimum: 13,
             requiredMarked: 0.24
         },
-
         3: {
             contrast: 13,
             minimum: 8,
@@ -764,38 +459,33 @@ function measure(
         }
     };
 
-    const setting =
-        settings[sensitivity] ||
-        settings[2];
+    const setting = settings[sensitivity] || settings[2];
 
-    const marked =
-        differences.filter(
-            value => value > setting.contrast
-        ).length / differences.length;
+    const marked = differences.filter(
+        value => value > setting.contrast
+    ).length / differences.length;
 
     return {
-        selected:
-            average >= setting.minimum &&
+        selected: average >= setting.minimum &&
             marked >= setting.requiredMarked,
-
         average,
         marked,
         baseline
     };
 }
 
-// ============================================================
-// VERIFY QR AGAINST MYSQL
-// ============================================================
-
+// VERIFY QR
 
 exports.verifyQR = async (req, res) => {
     try {
         const qr = parseQR(req.body?.qr_data);
+
         const [rows] = await pool.execute(
             `SELECT ballot_id, election_id, template_id, status
              FROM issued_ballots
-             WHERE ballot_id = ? AND election_id = ? AND template_id = ?
+             WHERE ballot_id = ?
+               AND election_id = ?
+               AND template_id = ?
              LIMIT 1`,
             [qr.ballot_id, qr.election_id, qr.template_id]
         );
@@ -844,24 +534,28 @@ exports.verifyQR = async (req, res) => {
             message: "Valid ballot. Ready for OMR analysis."
         });
     } catch (error) {
-        const invalid = error.message === "Invalid CampusVote ballot QR code.";
-        if (!invalid) console.error("QR verification error:", error);
+        const invalid =
+            error.message === "Invalid CampusVote ballot QR code.";
+
+        if (!invalid) {
+            console.error("QR verification error:", error);
+        }
 
         return res.status(invalid ? 422 : 500).json({
             valid: false,
-            message: invalid ? error.message : "QR verification failed."
+            message: invalid
+                ? error.message
+                : "QR verification failed."
         });
     }
 };
 
-
-// ============================================================
-// UPLOAD AND PROCESS BALLOT
-// ============================================================
-
+// OMR PROCESSING
 
 exports.uploadAndProcess = async (req, res) => {
     let db;
+    let transactionStarted = false;
+
     const preview = req.omrPreview === true;
     const counting = req.omrCounting === true;
 
@@ -886,48 +580,79 @@ exports.uploadAndProcess = async (req, res) => {
         const templateId = Number(req.body?.template_id);
 
         if (!req.file || !validId(electionId) || !validId(templateId)) {
-            return fail(400, "Ballot image, election ID and template ID are required.");
+            return fail(
+                400,
+                "Ballot image, election ID and template ID are required."
+            );
         }
 
         let qr;
+
         try {
             qr = await readBallotQR(req.file.path);
         } catch (error) {
             return fail(422, error.message);
         }
 
-        if (qr.election_id !== electionId || qr.template_id !== templateId) {
-            return fail(422, "QR does not match the selected election or template.");
+        if (qr.election_id !== electionId ||
+            qr.template_id !== templateId) {
+            return fail(
+                422,
+                "QR does not match the selected election or template."
+            );
         }
 
         db = await pool.getConnection();
 
         const [ballots] = await db.execute(
-            `SELECT status FROM issued_ballots
-             WHERE ballot_id = ? AND election_id = ? AND template_id = ?
+            `SELECT status
+             FROM issued_ballots
+             WHERE ballot_id = ?
+               AND election_id = ?
+               AND template_id = ?
              LIMIT 1`,
             [qr.ballot_id, electionId, templateId]
         );
 
-        if (!ballots.length) return fail(422, "Unregistered ballot.");
+        if (!ballots.length) {
+            return fail(422, "Unregistered ballot.");
+        }
 
         const ballotStatus = ballots[0].status;
 
         if (!["ISSUED", "CAST"].includes(ballotStatus)) {
-            return fail(409, "Ballot is not eligible for scanning.", {
-                status: ballotStatus,
-                duplicate: ballotStatus === "COUNTED"
-            });
+            return fail(
+                409,
+                "Ballot is not eligible for scanning.",
+                {
+                    status: ballotStatus,
+                    duplicate: ballotStatus === "COUNTED"
+                }
+            );
         }
 
-        const record = await getTemplateCoordinates(db, templateId, electionId);
+        const record = await getTemplateCoordinates(
+            db,
+            templateId,
+            electionId
+        );
 
-        if (!record) return fail(404, "Ballot template not found.");
+        if (!record) {
+            return fail(404, "Ballot template not found.");
+        }
+
         if (record.template.paper_size !== "A5") {
-            return fail(422, "OMR scanner currently requires an A5 template.");
+            return fail(
+                422,
+                "OMR scanner currently requires an A5 template."
+            );
         }
+
         if (!record.coordinates.length) {
-            return fail(422, "No saved bubble coordinates found.");
+            return fail(
+                422,
+                "No saved bubble coordinates found."
+            );
         }
 
         const { data, info } = await sharp(req.file.path)
@@ -942,13 +667,20 @@ exports.uploadAndProcess = async (req, res) => {
             height: info.height
         };
 
-        let marks, H;
+        let marks;
+        let H;
 
         try {
-            marks = await findMarkers(req.file.path, info.width, info.height);
+            marks = await findMarkers(
+                req.file.path,
+                info.width,
+                info.height
+            );
 
             if (marks.length !== 4) {
-                throw new Error("Four registration markers are required.");
+                throw new Error(
+                    "Four registration markers are required."
+                );
             }
 
             H = homography([
@@ -958,7 +690,10 @@ exports.uploadAndProcess = async (req, res) => {
                 { x: mm(200.5), y: mm(140.5) }
             ], marks);
         } catch (error) {
-            return fail(422, "Alignment failed. Retake the photo. " + error.message);
+            return fail(
+                422,
+                "Alignment failed. Retake the photo. " + error.message
+            );
         }
 
         const grouped = new Map();
@@ -969,18 +704,32 @@ exports.uploadAndProcess = async (req, res) => {
             const positionId = Number(coord.position_id);
             const maxSelection = Number(coord.max_selection);
 
-            if (!validId(candidateId) || !validId(positionId) ||
-                !validId(maxSelection) || seen.has(candidateId)) {
-                return fail(422, "Invalid or duplicate saved coordinates.");
+            if (!validId(candidateId) ||
+                !validId(positionId) ||
+                !validId(maxSelection) ||
+                seen.has(candidateId)) {
+                return fail(
+                    422,
+                    "Invalid or duplicate saved coordinates."
+                );
             }
 
             seen.add(candidateId);
 
             let measurement;
+
             try {
-                measurement = measure(image, H, coord, COUNTING_SENSITIVITY);
+                measurement = measure(
+                    image,
+                    H,
+                    coord,
+                    COUNTING_SENSITIVITY
+                );
             } catch (error) {
-                return fail(422, "Bubble alignment failed. " + error.message);
+                return fail(
+                    422,
+                    "Bubble alignment failed. " + error.message
+                );
             }
 
             if (!grouped.has(positionId)) {
@@ -995,10 +744,14 @@ exports.uploadAndProcess = async (req, res) => {
             const position = grouped.get(positionId);
 
             if (position.max_selection !== maxSelection) {
-                return fail(422, "Inconsistent maximum selections.");
+                return fail(
+                    422,
+                    "Inconsistent maximum selections."
+                );
             }
 
-            const unclear = !measurement.selected &&
+            const unclear =
+                !measurement.selected &&
                 measurement.average >= 9 &&
                 measurement.average < 18 &&
                 measurement.marked >= 0.12;
@@ -1008,21 +761,33 @@ exports.uploadAndProcess = async (req, res) => {
                 name: coord.candidate_name,
                 filled: measurement.selected,
                 unclear,
-                fill_intensity: Math.round(measurement.marked * 10000) / 100,
-                contrast: Math.round(measurement.average * 100) / 100
+                fill_intensity:
+                    Math.round(measurement.marked * 10000) / 100,
+                contrast:
+                    Math.round(measurement.average * 100) / 100
             });
         }
 
         const positions = [...grouped.values()].map(position => {
-            const markedCandidates = position.candidates.filter(c => c.filled);
+            const markedCandidates = position.candidates.filter(
+                candidate => candidate.filled
+            );
+
             const marked = markedCandidates.length;
             const overvoted = marked > position.max_selection;
-            const unclear = position.candidates.some(c => c.unclear);
+            const unclear = position.candidates.some(
+                candidate => candidate.unclear
+            );
 
             let result = "BLANK";
-            if (overvoted) result = "SKIPPED_OVERVOTE";
-            else if (unclear) result = "SKIPPED_UNCLEAR";
-            else if (marked > 0) result = "COUNTED";
+
+            if (overvoted) {
+                result = "SKIPPED_OVERVOTE";
+            } else if (unclear) {
+                result = "SKIPPED_UNCLEAR";
+            } else if (marked > 0) {
+                result = "COUNTED";
+            }
 
             return {
                 ...position,
@@ -1046,57 +811,98 @@ exports.uploadAndProcess = async (req, res) => {
                 : []
         );
 
+        // DATABASE COUNTING
 
-        const [elections] = await db.execute(
-            `SELECT status, scanning_open, scanning_closed_at,
-            is_current, archived_at
-     FROM elections
-     WHERE election_id = ?
-     LIMIT 1 FOR UPDATE`,
-            [electionId]
-        );
+        if (counting) {
+            await db.beginTransaction();
+            transactionStarted = true;
 
-        const election = elections[0];
-
-        const scanningAllowed =
-            !!election &&
-            Number(election.is_current) === 1 &&
-            Number(election.scanning_open) === 1 &&
-            !election.scanning_closed_at &&
-            !election.archived_at &&
-            ["active", "completed"].includes(
-                String(election.status).toLowerCase()
+            const [elections] = await db.execute(
+                `SELECT status, scanning_open,
+                        scanning_closed_at, is_current, archived_at
+                 FROM elections
+                 WHERE election_id = ?
+                 LIMIT 1 FOR UPDATE`,
+                [electionId]
             );
 
-        if (!scanningAllowed) {
-            await db.rollback();
-            return fail(
-                403,
-                "Election scanning is closed. No votes saved."
+            const election = elections[0];
+
+            const scanningAllowed =
+                !!election &&
+                Number(election.is_current) === 1 &&
+                Number(election.scanning_open) === 1 &&
+                !election.scanning_closed_at &&
+                !election.archived_at &&
+                ["active", "completed"].includes(
+                    String(election.status).toLowerCase()
+                );
+
+            if (!scanningAllowed) {
+                return fail(
+                    403,
+                    "Election scanning is closed. No votes saved."
+                );
+            }
+
+            const [locked] = await db.execute(
+                `SELECT status
+                 FROM issued_ballots
+                 WHERE ballot_id = ?
+                   AND election_id = ?
+                   AND template_id = ?
+                 FOR UPDATE`,
+                [qr.ballot_id, electionId, templateId]
             );
+
+            if (!locked.length ||
+                !["ISSUED", "CAST"].includes(locked[0].status)) {
+                return fail(
+                    409,
+                    "Duplicate, void or unavailable ballot.",
+                    {
+                        duplicate: locked[0]?.status === "COUNTED"
+                    }
+                );
+            }
+
+            for (const vote of votes) {
+                await db.execute(
+                    `INSERT INTO ballot_votes
+                     (ballot_id, candidate_id,
+                      position_id, fill_intensity)
+                     VALUES (?, ?, ?, ?)`,
+                    [
+                        qr.ballot_id,
+                        vote.candidate_id,
+                        vote.position_id,
+                        vote.fill_intensity
+                    ]
+                );
+            }
+
+            const [updated] = await db.execute(
+                `UPDATE issued_ballots
+                 SET status = 'COUNTED',
+                     counted_at = CURRENT_TIMESTAMP,
+                     cast_at = COALESCE(
+                         cast_at,
+                         CURRENT_TIMESTAMP
+                     )
+                 WHERE ballot_id = ?
+                   AND election_id = ?
+                   AND template_id = ?
+                   AND status IN ('ISSUED', 'CAST')`,
+                [qr.ballot_id, electionId, templateId]
+            );
+
+            if (updated.affectedRows !== 1) {
+                throw new Error("Ballot status update failed.");
+            }
+
+            await db.commit();
+            transactionStarted = false;
         }
-
-        const [locked] = await db.execute(
-            `SELECT status FROM issued_ballots
-     WHERE ballot_id = ?
-       AND election_id = ?
-       AND template_id = ?
-     FOR UPDATE`,
-            [qr.ballot_id, electionId, templateId]
-        );
-
-        if (
-            !locked.length ||
-            !["ISSUED", "CAST"].includes(locked[0].status)
-        ) {
-            await db.rollback();
-            return fail(
-                409,
-                "Duplicate, void or unavailable ballot.",
-                { duplicate: locked[0]?.status === "COUNTED" }
-            );
-        }
-
 
         return res.status(200).json({
             success: true,
@@ -1108,12 +914,22 @@ exports.uploadAndProcess = async (req, res) => {
             ballot_id: qr.ballot_id,
             status: counting ? "COUNTED" : ballotStatus,
             paper_size: record.template.paper_size,
-            source: { width: info.width, height: info.height },
+            source: {
+                width: info.width,
+                height: info.height
+            },
             markers_detected: marks.length,
             sensitivity: "Balanced",
-            selected_bubbles: positions.reduce((n, p) => n + p.marked, 0),
-            overvotes: positions.filter(p => p.overvoted).length,
-            skipped_positions: positions.filter(p => p.result.startsWith("SKIPPED")).length,
+            selected_bubbles: positions.reduce(
+                (total, position) => total + position.marked,
+                0
+            ),
+            overvotes: positions.filter(
+                position => position.overvoted
+            ).length,
+            skipped_positions: positions.filter(
+                position => position.result.startsWith("SKIPPED")
+            ).length,
             saved_votes: counting ? votes.length : 0,
             positions,
             message: counting
@@ -1121,35 +937,62 @@ exports.uploadAndProcess = async (req, res) => {
                 : `Preview complete. ${votes.length} valid votes detected. Nothing saved.`
         });
     } catch (error) {
+        if (db && transactionStarted) {
+            try {
+                await db.rollback();
+                transactionStarted = false;
+            } catch (rollbackError) {
+                console.error(
+                    "OMR rollback failed:",
+                    rollbackError
+                );
+            }
+        }
+
         console.error("OMR processing error:", error);
-        return fail(500, "OMR processing failed. Check backend logs.");
+
+        return fail(
+            500,
+            "OMR processing failed. Check backend logs."
+        );
     } finally {
-        if (db) db.release();
+        if (db) {
+            if (transactionStarted) {
+                try {
+                    await db.rollback();
+                } catch (rollbackError) {
+                    console.error(
+                        "OMR final rollback failed:",
+                        rollbackError
+                    );
+                }
+            }
+
+            db.release();
+        }
 
         if (req.file?.path) {
             try {
-                await require("fs/promises").unlink(req.file.path);
+                await fs.unlink(req.file.path);
             } catch (error) {
-                console.error("OMR cleanup error:", error.message);
+                console.error(
+                    "OMR cleanup error:",
+                    error.message
+                );
             }
         }
     }
 };
 
-// ============================================================
 // LIVE TALLIES
-// ============================================================
 
 exports.getLiveTallies = async (req, res) => {
     try {
-        const electionId = Number(
-            req.params.election_id
-        );
+        const electionId = Number(req.params.election_id);
 
         if (!validId(electionId)) {
             return res.status(400).json({
-                message:
-                    "Invalid election ID."
+                message: "Invalid election ID."
             });
         }
 
@@ -1157,27 +1000,18 @@ exports.getLiveTallies = async (req, res) => {
             `SELECT *
              FROM v_live_tallies
              WHERE election_id = ?
-             ORDER BY
-                position_id,
-                total_votes DESC`,
-            [
-                electionId
-            ]
+             ORDER BY position_id, total_votes DESC`,
+            [electionId]
         );
 
         return res.status(200).json({
             tallies: rows
         });
-
     } catch (error) {
-        console.error(
-            "Live tallies error:",
-            error
-        );
+        console.error("Live tallies error:", error);
 
         return res.status(500).json({
-            message:
-                "Failed to load live tallies."
+            message: "Failed to load live tallies."
         });
     }
 };
