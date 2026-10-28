@@ -456,9 +456,9 @@ async function findMarkers(
 
     if (
         Math.min(topWidth, bottomWidth) <
-            originalWidth * 0.35 ||
+        originalWidth * 0.35 ||
         Math.min(leftHeight, rightHeight) <
-            originalHeight * 0.35
+        originalHeight * 0.35
     ) {
         throw new Error(
             "Registration markers are too close. " +
@@ -1046,87 +1046,57 @@ exports.uploadAndProcess = async (req, res) => {
                 : []
         );
 
-        if (counting) {
-            await db.beginTransaction();
 
-            try {
-                const [locked] = await db.execute(
-                    `SELECT status FROM issued_ballots
-                     WHERE ballot_id = ? AND election_id = ? AND template_id = ?
-                     FOR UPDATE`,
-                    [qr.ballot_id, electionId, templateId]
-                );
+        const [elections] = await db.execute(
+            `SELECT status, scanning_open, scanning_closed_at,
+            is_current, archived_at
+     FROM elections
+     WHERE election_id = ?
+     LIMIT 1 FOR UPDATE`,
+            [electionId]
+        );
 
-                if (!locked.length || !["ISSUED", "CAST"].includes(locked[0].status)) {
-                    await db.rollback();
-                    return fail(409, "Duplicate, void or unavailable ballot.", {
-                        duplicate: locked[0]?.status === "COUNTED"
-                    });
-                }
+        const election = elections[0];
 
-                const [elections] = await db.execute(
-                    `SELECT scanning_open, is_current, is_active, archived_at
-                     FROM elections WHERE election_id = ? LIMIT 1`,
-                    [electionId]
-                );
+        const scanningAllowed =
+            !!election &&
+            Number(election.is_current) === 1 &&
+            Number(election.scanning_open) === 1 &&
+            !election.scanning_closed_at &&
+            !election.archived_at &&
+            ["active", "completed"].includes(
+                String(election.status).toLowerCase()
+            );
 
-                const election = elections[0];
-
-                if (!election || Number(election.scanning_open) !== 1 ||
-                    Number(election.is_current) !== 1 ||
-                    Number(election.is_active) !== 1 || election.archived_at) {
-                    await db.rollback();
-                    return fail(403, "Election scanning is closed. No votes saved.");
-                }
-
-                const [existing] = await db.execute(
-                    "SELECT ballot_id FROM scanned_ballots WHERE ballot_id = ? LIMIT 1",
-                    [qr.ballot_id]
-                );
-
-                if (existing.length) {
-                    await db.rollback();
-                    return fail(409, "This ballot has already been scanned.", {
-                        duplicate: true
-                    });
-                }
-
-                await db.execute(
-                    `INSERT INTO scanned_ballots
-                     (ballot_id, election_id, scanner_user_id)
-                     VALUES (?, ?, ?)`,
-                    [qr.ballot_id, electionId, req.user.id]
-                );
-
-                for (const vote of votes) {
-                    await db.execute(
-                        `INSERT INTO ballot_votes
-                         (ballot_id, candidate_id, position_id, fill_intensity)
-                         VALUES (?, ?, ?, ?)`,
-                        [
-                            qr.ballot_id,
-                            vote.candidate_id,
-                            vote.position_id,
-                            vote.fill_intensity
-                        ]
-                    );
-                }
-
-                await db.execute(
-                    `UPDATE issued_ballots
-                     SET status = 'COUNTED',
-                         cast_at = COALESCE(cast_at, NOW()),
-                         counted_at = NOW()
-                     WHERE ballot_id = ?`,
-                    [qr.ballot_id]
-                );
-
-                await db.commit();
-            } catch (error) {
-                await db.rollback();
-                throw error;
-            }
+        if (!scanningAllowed) {
+            await db.rollback();
+            return fail(
+                403,
+                "Election scanning is closed. No votes saved."
+            );
         }
+
+        const [locked] = await db.execute(
+            `SELECT status FROM issued_ballots
+     WHERE ballot_id = ?
+       AND election_id = ?
+       AND template_id = ?
+     FOR UPDATE`,
+            [qr.ballot_id, electionId, templateId]
+        );
+
+        if (
+            !locked.length ||
+            !["ISSUED", "CAST"].includes(locked[0].status)
+        ) {
+            await db.rollback();
+            return fail(
+                409,
+                "Duplicate, void or unavailable ballot.",
+                { duplicate: locked[0]?.status === "COUNTED" }
+            );
+        }
+
 
         return res.status(200).json({
             success: true,
