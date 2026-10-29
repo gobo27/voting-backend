@@ -492,7 +492,6 @@ exports.startElection = async (req, res) => {
     }
 };
 
-
 // STOP VOTING
 
 exports.stopVoting = async (req, res) => {
@@ -538,7 +537,6 @@ exports.stopVoting = async (req, res) => {
     }
 };
 
-
 // FINISH SCANNING
 
 exports.finishScanning = async (req, res) => {
@@ -570,19 +568,35 @@ exports.finishScanning = async (req, res) => {
                 }
 
                 const [pending] = await db.execute(
-                    `SELECT COUNT(*) AS total
+                    `SELECT
+                        status,
+                        COUNT(*) AS total
                      FROM issued_ballots
                      WHERE election_id = ?
-                       AND status = 'CAST'`,
+                       AND status IN ('CAST', 'ISSUED')
+                     GROUP BY status`,
                     [election.election_id]
                 );
 
-                if (Number(pending[0].total) > 0) {
+                const totals = {
+                    CAST: 0,
+                    ISSUED: 0
+                };
+
+                for (const row of pending) {
+                    totals[row.status] = Number(row.total);
+                }
+
+                if (totals.CAST > 0 || totals.ISSUED > 0) {
                     return {
                         status: 409,
                         body: {
                             message:
-                                `${pending[0].total} received ballot(s) are not yet counted.`
+                                `Cannot finish scanning. ` +
+                                `${totals.CAST} received ballot(s) ` +
+                                `are not yet counted and ` +
+                                `${totals.ISSUED} issued ballot(s) ` +
+                                `still need reconciliation.`
                         }
                     };
                 }
@@ -619,7 +633,6 @@ exports.finishScanning = async (req, res) => {
         return serverError(res, "Finish scanning:", error);
     }
 };
-
 
 // COUNTING STATUS
 
@@ -712,5 +725,150 @@ exports.toggleMaskNames = async (req, res) => {
 
     } catch (error) {
         return serverError(res, "Toggle mask names:", error);
+    }
+};
+
+// ================= UNUSED BALLOT MANAGEMENT =================
+
+exports.listUnusedBallots = async (req, res) => {
+    try {
+        const election = await resolveElection(req.params.election_id);
+
+        if (!election || Number(election.is_current) !== 1 || election.archived_at) {
+            return res.status(404).json({
+                message: "Current election not found."
+            });
+        }
+
+        const [rows] = await pool.execute(
+            `SELECT ballot_id, batch_id, template_id
+             FROM issued_ballots
+             WHERE election_id = ?
+               AND status = 'ISSUED'
+             ORDER BY batch_id, ballot_id`,
+            [election.election_id]
+        );
+
+        return res.json({
+            election_id: election.election_id,
+            message: "Verify each physical ballot before voiding.",
+            ballots: rows
+        });
+
+    } catch (error) {
+        return serverError(res, "List unused ballots:", error);
+    }
+};
+
+//  VOID UNUSED BALLOTS
+
+exports.voidUnusedBallots = async (req, res) => {
+    const ids = req.body?.ballot_ids;
+    const reason = String(req.body?.reason || "").trim();
+    const verified = req.body?.physically_verified === true;
+
+    const uuidPattern =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    if (
+        !Array.isArray(ids) ||
+        ids.length < 1 ||
+        ids.length > 100 ||
+        ids.some(id =>
+            typeof id !== "string" ||
+            !uuidPattern.test(id)
+        ) ||
+        new Set(ids.map(id => id.toLowerCase())).size !== ids.length ||
+        reason.length < 10 ||
+        reason.length > 500 ||
+        !verified
+    ) {
+        return res.status(400).json({
+            message:
+                "Select 1-100 unique ballots, enter a reason of 10-500 characters, and confirm physical verification."
+        });
+    }
+
+    try {
+        const result = await withCurrentElection(
+            req.params.election_id,
+            async (db, election, phNow) => {
+
+                if (
+                    !scanningOpen(election) ||
+                    votingOpen(election, phNow)
+                ) {
+                    return {
+                        status: 409,
+                        body: {
+                            message:
+                                "Voting must be closed before unused ballots can be voided."
+                        }
+                    };
+                }
+
+                const normalized = ids.map(id => id.toLowerCase());
+                const placeholders = normalized.map(() => "?").join(",");
+
+                const [rows] = await db.query(
+                    `SELECT ballot_id, status
+                     FROM issued_ballots
+                     WHERE election_id = ?
+                       AND ballot_id IN (${placeholders})
+                     FOR UPDATE`,
+                    [election.election_id, ...normalized]
+                );
+
+                if (
+                    rows.length !== normalized.length ||
+                    rows.some(row => row.status !== "ISSUED")
+                ) {
+                    return {
+                        status: 409,
+                        body: {
+                            message:
+                                "One or more ballots are missing or already processed. No ballots were voided."
+                        }
+                    };
+                }
+
+                const [update] = await db.query(
+                    `UPDATE issued_ballots
+                     SET status = 'VOID'
+                     WHERE election_id = ?
+                       AND status = 'ISSUED'
+                       AND ballot_id IN (${placeholders})`,
+                    [election.election_id, ...normalized]
+                );
+
+                if (update.affectedRows !== normalized.length) {
+                    throw new Error("Ballot update count mismatch.");
+                }
+
+                for (const ballotId of normalized) {
+                    await db.execute(
+                        `INSERT INTO ballot_void_audit
+                         (election_id, ballot_id, reason, verified_unused)
+                         VALUES (?, ?, ?, 1)`,
+                        [election.election_id, ballotId, reason]
+                    );
+                }
+
+                return {
+                    status: 200,
+                    body: {
+                        success: true,
+                        voided: normalized.length,
+                        message:
+                            `${normalized.length} unused ballot(s) successfully voided.`
+                    }
+                };
+            }
+        );
+
+        return res.status(result.status).json(result.body);
+
+    } catch (error) {
+        return serverError(res, "Void unused ballots:", error);
     }
 };

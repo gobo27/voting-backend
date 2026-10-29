@@ -1,3 +1,4 @@
+
 "use strict";
 
 const crypto = require("crypto");
@@ -18,7 +19,11 @@ function qrPayload(ballot) {
     ].join("|");
 }
 
+// =========================================
+// GENERATE REGISTERED QR BALLOT BATCH
 // POST /api/ballots/qr/batches
+// =========================================
+
 exports.createBatch = async (req, res) => {
     const electionId = Number(req.body.election_id);
     const templateId = Number(req.body.template_id);
@@ -32,7 +37,8 @@ exports.createBatch = async (req, res) => {
         quantity > 500
     ) {
         return res.status(400).json({
-            message: "Valid election, template and quantity (1-500) required."
+            message:
+                "Valid election, template and quantity (1-500) required."
         });
     }
 
@@ -75,7 +81,12 @@ exports.createBatch = async (req, res) => {
                 `INSERT INTO issued_ballots
                  (ballot_id, batch_id, election_id, template_id)
                  VALUES (?, ?, ?, ?)`,
-                [ballotId, batchId, electionId, templateId]
+                [
+                    ballotId,
+                    batchId,
+                    electionId,
+                    templateId
+                ]
             );
 
             ballots.push({
@@ -130,7 +141,11 @@ exports.createBatch = async (req, res) => {
     }
 };
 
+// =========================================
+// GET EXISTING QR BATCH FOR REPRINT
 // GET /api/ballots/qr/batches/:batch_id
+// =========================================
+
 exports.getBatch = async (req, res) => {
     const batchId = Number(req.params.batch_id);
 
@@ -142,7 +157,10 @@ exports.getBatch = async (req, res) => {
 
     try {
         const [rows] = await pool.execute(
-            `SELECT ballot_id, election_id, template_id, status
+            `SELECT ballot_id,
+                    election_id,
+                    template_id,
+                    status
              FROM issued_ballots
              WHERE batch_id = ?
              ORDER BY created_at, ballot_id`,
@@ -182,8 +200,12 @@ exports.getBatch = async (req, res) => {
             message: "Failed to load batch."
         });
     }
-
 };
+
+// =========================================
+// LIST REGISTERED QR BATCHES
+// GET /api/ballots/qr/batches/election/:election_id
+// =========================================
 
 exports.listBatchesByElection = async (req, res) => {
     const electionId = Number(req.params.election_id);
@@ -234,9 +256,11 @@ exports.listBatchesByElection = async (req, res) => {
             LEFT JOIN issued_ballots i
                 ON i.batch_id = b.batch_id
             WHERE b.election_id = ?
-            ${templateId !== null
-                ? "AND b.template_id = ?"
-                : ""}
+            ${
+                templateId !== null
+                    ? "AND b.template_id = ?"
+                    : ""
+            }
             GROUP BY
                 b.batch_id,
                 b.election_id,
@@ -266,16 +290,301 @@ exports.listBatchesByElection = async (req, res) => {
                 template_name: row.template_name,
                 paper_size: row.paper_size,
                 quantity: Number(row.quantity),
-                registered_count: Number(row.registered_count),
+                registered_count: Number(
+                    row.registered_count
+                ),
                 created_at: row.created_at
             }))
         });
 
     } catch (error) {
-        console.error("List QR batches error:", error);
+        console.error(
+            "List QR batches error:",
+            error
+        );
 
         return res.status(500).json({
-            message: "Failed to load registered QR batches."
+            message:
+                "Failed to load registered QR batches."
+        });
+    }
+};
+
+// =========================================
+// CONFIRM PHYSICAL PRINT QUANTITY
+// POST /api/ballots/qr/batches/:batch_id/confirm-print
+// =========================================
+
+exports.confirmPrint = async (req, res) => {
+    const batchId = Number(req.params.batch_id);
+
+    const { event_id, print_type } = req.body || {};
+
+    const quantity = Number(req.body?.quantity);
+
+    const validEventId =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    if (
+        !validId(batchId) ||
+        !validEventId.test(String(event_id || "")) ||
+        !["ORIGINAL", "REPRINT"].includes(print_type) ||
+        !Number.isSafeInteger(quantity) ||
+        quantity < 1 ||
+        quantity > 500
+    ) {
+        return res.status(400).json({
+            message: "Invalid print confirmation."
+        });
+    }
+
+    let db;
+
+    try {
+        db = await pool.getConnection();
+
+        await db.beginTransaction();
+
+        // Prevent duplicate records from repeated requests.
+        const [existing] = await db.execute(
+            `SELECT
+                event_id,
+                batch_id,
+                print_type,
+                quantity
+             FROM ballot_print_logs
+             WHERE event_id = ?`,
+            [event_id]
+        );
+
+        if (existing.length) {
+            const previous = existing[0];
+
+            if (
+                Number(previous.batch_id) !== batchId ||
+                previous.print_type !== print_type ||
+                Number(previous.quantity) !== quantity
+            ) {
+                await db.rollback();
+
+                return res.status(409).json({
+                    message:
+                        "Print event ID already used with different details."
+                });
+            }
+
+            await db.commit();
+
+            return res.json({
+                message: "Print already recorded.",
+                event_id,
+                already_recorded: true
+            });
+        }
+
+        const [batches] = await db.execute(
+            `SELECT
+                batch_id,
+                election_id,
+                quantity
+             FROM ballot_print_batches
+             WHERE batch_id = ?
+             FOR UPDATE`,
+            [batchId]
+        );
+
+        if (!batches.length) {
+            await db.rollback();
+
+            return res.status(404).json({
+                message: "Print batch not found."
+            });
+        }
+
+        const batch = batches[0];
+
+        // Current system confirms a complete batch.
+        if (quantity !== Number(batch.quantity)) {
+            await db.rollback();
+
+            return res.status(400).json({
+                message:
+                    "Print the entire batch; quantity must equal the registered batch size."
+            });
+        }
+
+        const [originals] = await db.execute(
+            `SELECT event_id
+             FROM ballot_print_logs
+             WHERE batch_id = ?
+               AND print_type = 'ORIGINAL'
+             LIMIT 1`,
+            [batchId]
+        );
+
+        if (
+            print_type === "ORIGINAL" &&
+            originals.length
+        ) {
+            await db.rollback();
+
+            return res.status(409).json({
+                message:
+                    "Original print already confirmed. Use REPRINT."
+            });
+        }
+
+        if (
+            print_type === "REPRINT" &&
+            !originals.length
+        ) {
+            await db.rollback();
+
+            return res.status(409).json({
+                message:
+                    "Confirm the original printing first."
+            });
+        }
+
+        await db.execute(
+            `INSERT INTO ballot_print_logs
+             (
+                event_id,
+                batch_id,
+                election_id,
+                print_type,
+                quantity
+             )
+             VALUES (?, ?, ?, ?, ?)`,
+            [
+                event_id,
+                batchId,
+                batch.election_id,
+                print_type,
+                quantity
+            ]
+        );
+
+        await db.commit();
+
+        return res.status(201).json({
+            message:
+                "Physical print quantity recorded.",
+            event_id,
+            quantity
+        });
+
+    } catch (error) {
+        if (db) {
+            try {
+                await db.rollback();
+            } catch (_) {}
+        }
+
+        console.error("Confirm print error:", error);
+
+        return res.status(500).json({
+            message:
+                "Failed to save print confirmation."
+        });
+
+    } finally {
+        if (db) db.release();
+    }
+};
+
+// =========================================
+// GET ORIGINAL / REPRINT / OVERALL TOTALS
+// GET /api/ballots/qr/print-summary/election/:election_id
+// =========================================
+
+exports.getPrintSummary = async (req, res) => {
+    const electionId = Number(
+        req.params.election_id
+    );
+
+    if (!validId(electionId)) {
+        return res.status(400).json({
+            message: "Invalid election ID."
+        });
+    }
+
+    try {
+        const [registered] = await pool.execute(
+            `SELECT COUNT(*) AS count
+             FROM issued_ballots
+             WHERE election_id = ?`,
+            [electionId]
+        );
+
+        const [printed] = await pool.execute(
+            `SELECT
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN print_type = 'ORIGINAL'
+                            THEN quantity
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS original,
+
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN print_type = 'REPRINT'
+                            THEN quantity
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS reprints,
+
+                COALESCE(
+                    SUM(quantity),
+                    0
+                ) AS overall
+
+             FROM ballot_print_logs
+             WHERE election_id = ?`,
+            [electionId]
+        );
+
+        return res.json({
+            election_id: electionId,
+
+            registered_unique: Number(
+                registered[0].count
+            ),
+
+            original: Number(
+                printed[0].original
+            ),
+
+            reprints: Number(
+                printed[0].reprints
+            ),
+
+            overall: Number(
+                printed[0].overall
+            ),
+
+            unit: "individual A5 ballots",
+
+            note:
+                "Counts are operator-confirmed, not printer-verified. Earlier print jobs are not backfilled."
+        });
+
+    } catch (error) {
+        console.error(
+            "Print summary error:",
+            error
+        );
+
+        return res.status(500).json({
+            message:
+                "Failed to load print summary."
         });
     }
 };

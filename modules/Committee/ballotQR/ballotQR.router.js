@@ -57,13 +57,27 @@ router.post(
     qrController.createBatch
 );
 
-// List existing batches
 router.get(
     "/qr/batches/election/:election_id",
     qrController.listBatchesByElection
 );
 
-// Reprint original batch
-router.get("/qr/batches/:batch_id",qrController.getBatch);
+router.get(
+    "/qr/batches/:batch_id",
+    qrController.getBatch
+);
+
+// PRINT TRACKING
+
+router.post(
+    "/qr/batches/:batch_id/confirm-print",
+    verifyToken.requireRole("super_admin", "committee"),
+    qrController.confirmPrint
+);
+
+router.get(
+    "/qr/print-summary/election/:election_id",
+    qrController.getPrintSummary
+);
 
 module.exports = router;
