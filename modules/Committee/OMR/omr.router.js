@@ -7,12 +7,18 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
+
 const omrController = require("./omr.controller");
 const middleware = require("../../sheared/middleware");
 
 const router = express.Router();
 const verifyToken = middleware.verifyToken || middleware;
-const uploadDir = path.join(os.tmpdir(), "campusvote-omr-uploads");
+
+const uploadDir = path.join(
+    os.tmpdir(),
+    "campusvote-omr-uploads"
+);
+
 const MAX_SIZE = 10 * 1024 * 1024;
 
 const extensions = {
@@ -24,27 +30,52 @@ const extensions = {
 const storage = multer.diskStorage({
     destination(req, file, cb) {
         try {
-            fs.mkdirSync(uploadDir, { recursive: true });
+            fs.mkdirSync(uploadDir, {
+                recursive: true
+            });
+
             cb(null, uploadDir);
         } catch (error) {
             cb(error);
         }
     },
+
     filename(req, file, cb) {
-        const ext = path.extname(file.originalname || "").toLowerCase();
-        cb(null, `${Date.now()}-${crypto.randomUUID()}${ext}`);
+        const ext = path.extname(
+            file.originalname || ""
+        ).toLowerCase();
+
+        cb(
+            null,
+            `${Date.now()}-${crypto.randomUUID()}${ext}`
+        );
     }
 });
 
 const upload = multer({
     storage,
-    limits: { fileSize: MAX_SIZE, files: 1, fields: 10 },
+
+    limits: {
+        fileSize: MAX_SIZE,
+        files: 1,
+        fields: 10
+    },
+
     fileFilter(req, file, cb) {
-        const mime = String(file.mimetype || "").toLowerCase();
-        const ext = path.extname(file.originalname || "").toLowerCase();
+        const mime = String(
+            file.mimetype || ""
+        ).toLowerCase();
+
+        const ext = path.extname(
+            file.originalname || ""
+        ).toLowerCase();
 
         if (!extensions[mime]?.includes(ext)) {
-            return cb(new Error("Only matching JPG, PNG or WEBP images are allowed."));
+            return cb(
+                new Error(
+                    "Only matching JPG, PNG or WEBP images are allowed."
+                )
+            );
         }
 
         cb(null, true);
@@ -53,7 +84,9 @@ const upload = multer({
 
 function uploadBallot(req, res, next) {
     upload.single("ballot_image")(req, res, error => {
-        if (error) return next(error);
+        if (error) {
+            return next(error);
+        }
 
         if (!req.file) {
             return res.status(400).json({
@@ -68,14 +101,22 @@ function uploadBallot(req, res, next) {
 
 router.use(
     verifyToken,
-    middleware.requireRole("super_admin", "committee")
+    middleware.requireRole(
+        "super_admin",
+        "committee"
+    )
 );
 
-router.get("/tallies/:election_id", omrController.getLiveTallies);
+router.get(
+    "/tallies/:election_id",
+    omrController.getLiveTallies
+);
 
 router.post(
     "/verify-qr",
-    express.json({ limit: "32kb" }),
+    express.json({
+        limit: "32kb"
+    }),
     omrController.verifyQR
 );
 
@@ -93,13 +134,16 @@ router.post(
 router.post(
     "/scan",
     (req, res, next) => {
-        if (process.env.OMR_COUNTING_ENABLED !== "true") {
+        if (
+            process.env.OMR_COUNTING_ENABLED !== "true"
+        ) {
             return res.status(403).json({
                 success: false,
                 counting_enabled: false,
                 message: "Live counting is disabled. Use preview mode."
             });
         }
+
         next();
     },
     uploadBallot,
@@ -117,20 +161,24 @@ router.use((error, req, res, next) => {
     if (error instanceof multer.MulterError) {
         return res.status(400).json({
             success: false,
-            message: error.code === "LIMIT_FILE_SIZE"
-                ? "Image exceeds the 10MB limit."
-                : error.message
+            message:
+                error.code === "LIMIT_FILE_SIZE"
+                    ? "Image exceeds the 10MB limit."
+                    : error.message
         });
     }
 
-    if (error.message === "Only matching JPG, PNG or WEBP images are allowed.") {
+    if (
+        error.message ===
+        "Only matching JPG, PNG or WEBP images are allowed."
+    ) {
         return res.status(400).json({
             success: false,
             message: error.message
         });
     }
 
-    res.status(500).json({
+    return res.status(500).json({
         success: false,
         message: "OMR upload failed."
     });
