@@ -5,7 +5,7 @@ const express = require("express");
 const router = express.Router();
 
 const dashboardController = require("./dashboard.controller");
-const verifyToken = require("../../sheared/middleware");
+const verifyToken = require("../../modules/sheared/middleware");
 
 // Public dashboard
 router.get(
