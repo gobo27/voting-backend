@@ -349,6 +349,8 @@ async function findMarkers(
                             stack.push(q);
                         }
                     }
+
+                    }
                 }
 
                 const bw = maxX - minX + 1;
@@ -439,7 +441,7 @@ async function findMarkers(
     }
 
     return [tl, tr, bl, br];
-}
+
 
 /* HOMOGRAPHY AND COORDINATE ALIGNMENT */
 
@@ -685,24 +687,20 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
 
 function validatePositionVotes(grouped) {
     const positions = [...grouped.values()].map(position => {
-        const markedCandidates = position.candidates.filter(
-            candidate => candidate.filled
-        );
-
+        const markedCandidates = position.candidates.filter(candidate => candidate.filled);
         const marked = markedCandidates.length;
         const overvoted = marked > position.max_selection;
+        const unclear = position.candidates.some(candidate => candidate.unclear);
 
-        const unclear = position.candidates.some(
-            candidate => candidate.unclear
-        );
-
+        // Never silently discard confirmed votes because a bubble is ambiguous.
+        // Ambiguous positions require a clearer scan before the ballot is finalized.
         let result = "BLANK";
-
         if (overvoted) {
             result = "SKIPPED_OVERVOTE";
         } else if (unclear) {
-            result = "SKIPPED_UNCLEAR";
+            result = "NEEDS_REVIEW";
         } else if (marked > 0) {
+
             result = "COUNTED";
         }
 
@@ -728,10 +726,7 @@ function validatePositionVotes(grouped) {
             : []
     );
 
-    return {
-        positions,
-        votes
-    };
+    return { positions, votes };
 }
 
 /* CANDIDATE BUBBLE ANALYSIS */
@@ -1056,6 +1051,7 @@ exports.uploadAndProcess = async (req, res) => {
 
             const markerPoints = [
                 { x: mm(9.5), y: mm(7.5) },
+
                 { x: mm(138.5), y: mm(7.5) },
                 { x: mm(9.5), y: mm(200.5) },
                 { x: mm(138.5), y: mm(200.5) }
@@ -1088,6 +1084,26 @@ exports.uploadAndProcess = async (req, res) => {
 
         const { positions, votes } = analysis;
 
+        // Never finalize a ballot with unresolved bubble readings.
+        // This protects potentially valid votes from being lost.
+        const needsReview = positions.filter(
+            position => position.result === "NEEDS_REVIEW"
+        );
+
+        if (counting && needsReview.length) {
+            return fail(
+                422,
+                "Unclear shading detected. No votes saved. Retake or rescan the ballot.",
+                {
+                    review_required: true,
+                    positions,
+                    unclear_positions: needsReview.map(
+                        position => position.position_name
+                    )
+                }
+            );
+        }
+
         if (counting && votes.length === 0) {
             return fail(
                 422,
@@ -1101,8 +1117,12 @@ exports.uploadAndProcess = async (req, res) => {
             transactionStarted = true;
 
             const [elections] = await db.execute(
-                `SELECT status, scanning_open, scanning_closed_at,
-                        is_current, archived_at
+                `SELECT
+                    status,
+                    scanning_open,
+                    scanning_closed_at,
+                    is_current,
+                    archived_at
                  FROM elections
                  WHERE election_id = ?
                  LIMIT 1
@@ -1137,7 +1157,11 @@ exports.uploadAndProcess = async (req, res) => {
                    AND template_id = ?
                  LIMIT 1
                  FOR UPDATE`,
-                [qr.ballot_id, electionId, templateId]
+                [
+                    qr.ballot_id,
+                    electionId,
+                    templateId
+                ]
             );
 
             if (!locked.length) {
@@ -1149,11 +1173,13 @@ exports.uploadAndProcess = async (req, res) => {
                     409,
                     "Duplicate, void or unavailable ballot.",
                     {
-                        duplicate: locked[0].status === "COUNTED"
+                        duplicate:
+                            locked[0].status === "COUNTED"
                     }
                 );
             }
 
+            // Verify every selected candidate belongs to this election.
             for (const vote of votes) {
                 const [candidateRows] = await db.execute(
                     `SELECT c.candidate_id
@@ -1181,10 +1207,16 @@ exports.uploadAndProcess = async (req, res) => {
                 }
             }
 
+            // Save all confirmed valid votes.
             for (const vote of votes) {
                 await db.execute(
                     `INSERT INTO ballot_votes
-                        (ballot_id, candidate_id, position_id, fill_intensity)
+                        (
+                            ballot_id,
+                            candidate_id,
+                            position_id,
+                            fill_intensity
+                        )
                      VALUES (?, ?, ?, ?)`,
                     [
                         qr.ballot_id,
@@ -1195,20 +1227,32 @@ exports.uploadAndProcess = async (req, res) => {
                 );
             }
 
+            // Mark ballot as COUNTED only after votes are inserted.
             const [updated] = await db.execute(
                 `UPDATE issued_ballots
-                 SET status = 'COUNTED',
-                     counted_at = CURRENT_TIMESTAMP,
-                     cast_at = COALESCE(cast_at, CURRENT_TIMESTAMP)
+                 SET
+                    status = 'COUNTED',
+                    counted_at = CURRENT_TIMESTAMP,
+                    cast_at = COALESCE(
+                        cast_at,
+                        CURRENT_TIMESTAMP
+                    )
                  WHERE ballot_id = ?
                    AND election_id = ?
                    AND template_id = ?
                    AND status IN ('ISSUED', 'CAST')`,
-                [qr.ballot_id, electionId, templateId]
+                [
+                    qr.ballot_id,
+                    electionId,
+                    templateId
+                ]
             );
 
             if (updated.affectedRows !== 1) {
-                reject(409, "Ballot status update failed.");
+                reject(
+                    409,
+                    "Ballot status update failed."
+                );
             }
 
             await db.commit();
@@ -1216,7 +1260,8 @@ exports.uploadAndProcess = async (req, res) => {
         }
 
         const selectedBubbles = positions.reduce(
-            (total, position) => total + position.marked,
+            (total, position) =>
+                total + position.marked,
             0
         );
 
@@ -1248,6 +1293,10 @@ exports.uploadAndProcess = async (req, res) => {
             selected_bubbles: selectedBubbles,
             overvotes,
             skipped_positions: skippedPositions,
+            review_required: needsReview.length > 0,
+            unclear_positions: needsReview.map(
+                position => position.position_name
+            ),
             saved_votes: counting ? votes.length : 0,
             positions,
             message: counting
@@ -1261,23 +1310,32 @@ exports.uploadAndProcess = async (req, res) => {
                 await db.rollback();
                 transactionStarted = false;
             } catch (rollbackError) {
-                console.error("OMR rollback failed:", rollbackError);
+                console.error(
+                    "OMR rollback failed:",
+                    rollbackError
+                );
             }
         }
 
         console.error("OMR processing error:", error);
 
         if (error.httpStatus) {
-            return fail(error.httpStatus, error.message, {
-                duplicate: error.duplicate === true
-            });
+            return fail(
+                error.httpStatus,
+                error.message,
+                {
+                    duplicate: error.duplicate === true
+                }
+            );
         }
 
         if (error.code === "ER_DUP_ENTRY") {
             return fail(
                 409,
                 "Duplicate vote record. No votes saved.",
-                { duplicate: true }
+                {
+                    duplicate: true
+                }
             );
         }
 
@@ -1295,18 +1353,22 @@ exports.uploadAndProcess = async (req, res) => {
             try {
                 await fs.unlink(req.file.path);
             } catch (error) {
-                console.error("OMR cleanup error:", error.message);
+                console.error(
+                    "OMR cleanup error:",
+                    error.message
+                );
             }
         }
     }
 };
 
-
 /* LIVE RESULTS */
 
 exports.getLiveTallies = async (req, res) => {
     try {
-        const electionId = Number(req.params.election_id);
+        const electionId = Number(
+            req.params.election_id
+        );
 
         if (!validId(electionId)) {
             return res.status(400).json({
