@@ -316,15 +316,15 @@ async function buildOverview(election, adminAccess = false) {
             .sort((a, b) =>
                 revealVotes
                     ? Number(b.total_votes) -
-                      Number(a.total_votes) ||
-                      Number(a.display_order) -
-                      Number(b.display_order) ||
-                      Number(a.candidate_id) -
-                      Number(b.candidate_id)
+                    Number(a.total_votes) ||
+                    Number(a.display_order) -
+                    Number(b.display_order) ||
+                    Number(a.candidate_id) -
+                    Number(b.candidate_id)
                     : Number(a.display_order) -
-                      Number(b.display_order) ||
-                      Number(a.candidate_id) -
-                      Number(b.candidate_id)
+                    Number(b.display_order) ||
+                    Number(a.candidate_id) -
+                    Number(b.candidate_id)
             )
             .map(candidate => ({
                 candidate_id: candidate.candidate_id,
@@ -364,12 +364,12 @@ async function buildOverview(election, adminAccess = false) {
 
         positions: result,
 
+
         statistics: {
-            scanned_ballots: revealVotes
-                ? Number(ballotCount[0]?.total || 0)
-                : 0,
+            scanned_ballots: Number(ballotCount[0]?.total || 0),
             total_candidates: candidates.length
         }
+
     };
 }
 
