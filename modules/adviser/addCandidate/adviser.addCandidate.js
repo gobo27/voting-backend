@@ -95,7 +95,7 @@ exports.getCandidates = async (req, res) => {
 
         if (!election) {
             return res.status(200).json({
-                election_id: null,
+                election_id: "",
                 candidates: [],
                 message: "No current election found"
             });

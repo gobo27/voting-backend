@@ -278,9 +278,10 @@ async function buildOverview(election, adminAccess = false) {
             AND bv.position_id = c.position_id
             AND EXISTS (
                 SELECT 1
-                FROM scanned_ballots sb
-                WHERE sb.ballot_id = bv.ballot_id
-                  AND sb.election_id = ?
+                FROM issued_ballots ib
+                WHERE ib.ballot_id = bv.ballot_id
+                  AND ib.election_id = ?
+                  AND ib.status = 'COUNTED'
             )
          WHERE p.election_id = ?
          GROUP BY
@@ -342,8 +343,9 @@ async function buildOverview(election, adminAccess = false) {
 
     const [ballotCount] = await connection.execute(
         `SELECT COUNT(*) AS total
-         FROM scanned_ballots
-         WHERE election_id = ?`,
+         FROM issued_ballots
+         WHERE election_id = ?
+           AND status = 'COUNTED'`,
         [electionId]
     );
 
