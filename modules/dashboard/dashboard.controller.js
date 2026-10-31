@@ -299,8 +299,7 @@ async function buildOverview(election, adminAccess = false) {
     const revealNames =
         adminAccess || canShowNames(election);
 
-    const revealVotes =
-        adminAccess || canShowVotes(election);
+    const revealVotes =true;
 
     const result = positions.map(position => ({
         position_id: position.position_id,
