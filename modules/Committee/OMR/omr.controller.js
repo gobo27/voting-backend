@@ -349,8 +349,6 @@ async function findMarkers(
                             stack.push(q);
                         }
                     }
-
-                    }
                 }
 
                 const bw = maxX - minX + 1;
@@ -441,7 +439,7 @@ async function findMarkers(
     }
 
     return [tl, tr, bl, br];
-
+}
 
 /* HOMOGRAPHY AND COORDINATE ALIGNMENT */
 
@@ -1051,7 +1049,6 @@ exports.uploadAndProcess = async (req, res) => {
 
             const markerPoints = [
                 { x: mm(9.5), y: mm(7.5) },
-
                 { x: mm(138.5), y: mm(7.5) },
                 { x: mm(9.5), y: mm(200.5) },
                 { x: mm(138.5), y: mm(200.5) }
@@ -1105,10 +1102,36 @@ exports.uploadAndProcess = async (req, res) => {
         }
 
         if (counting && votes.length === 0) {
+            // Diagnostic-only information. No ballot is counted or marked used.
+            // Inspect this in a controlled test; remove detailed measurements
+            // from public production responses after the alignment is fixed.
             return fail(
                 422,
                 "Blank ballot detected. No votes counted. " +
-                "This ballot can still be used."
+                "This ballot can still be used.",
+                {
+                    diagnostic: {
+                        image: {
+                            width: info.width,
+                            height: info.height
+                        },
+                        registration_marks: marks.map(mark => ({
+                            x: Math.round(mark.x * 10) / 10,
+                            y: Math.round(mark.y * 10) / 10
+                        })),
+                        positions: positions.map(position => ({
+                            position: position.position_name,
+                            result: position.result,
+                            candidates: position.candidates.map(candidate => ({
+                                name: candidate.name,
+                                contrast: candidate.contrast,
+                                fill_intensity: candidate.fill_intensity,
+                                filled: candidate.filled,
+                                unclear: candidate.unclear
+                            }))
+                        }))
+                    }
+                }
             );
         }
 
