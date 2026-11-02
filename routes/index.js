@@ -22,7 +22,7 @@ router.use("/candidates", candidateRoutes);
 router.use("/positions", positionRoutes);
 router.use("/election", electionControlRoutes);
 router.use("/ballots", ballotRoutes);
-router.use("/ballots/qr", ballotQRRoutes);
+router.use("/ballots", ballotQRRoutes);
 router.use("/omr", omrRoutes);
 router.use("/ballots",ballotReceivingRoutes);
 router.use("/dashboard", dashboardRoutes);
