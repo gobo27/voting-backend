@@ -478,6 +478,7 @@ function solve8(A, b) {
             }
 
             b[j] -= factor * b[i];
+
         }
     }
 
@@ -898,6 +899,7 @@ exports.uploadAndProcess = async (req, res) => {
 
     const reject = (status, message, extra = {}) => {
         const error = new Error(message);
+
         error.httpStatus = status;
         Object.assign(error, extra);
         throw error;
@@ -1023,15 +1025,8 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
-        const aspect = info.width / info.height;
-        const expectedAspect = paper.width / paper.height;
-
-        if (Math.abs(aspect - expectedAspect) > 0.12) {
-            return fail(
-                422,
-                "Expected one A5 portrait ballot per scan."
-            );
-        }
+        // Camera photo may include background around the A5 paper.
+        // Validate the ballot geometry using its four markers instead.
 
         let marks;
         let H;
@@ -1053,6 +1048,28 @@ exports.uploadAndProcess = async (req, res) => {
                 { x: mm(9.5), y: mm(200.5) },
                 { x: mm(138.5), y: mm(200.5) }
             ];
+
+            // Check marker geometry before reading any votes.
+            const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+            const top = distance(marks[0], marks[1]);
+            const bottom = distance(marks[2], marks[3]);
+            const left = distance(marks[0], marks[2]);
+            const right = distance(marks[1], marks[3]);
+            const measuredRatio = ((top + bottom) / 2) / ((left + right) / 2);
+            const expectedRatio =
+                (markerPoints[1].x - markerPoints[0].x) /
+                (markerPoints[2].y - markerPoints[0].y);
+
+            if (
+                !Number.isFinite(measuredRatio) ||
+                Math.abs(measuredRatio - expectedRatio) > 0.22 ||
+                Math.abs(top - bottom) / Math.max(top, bottom) > 0.35 ||
+                Math.abs(left - right) / Math.max(left, right) > 0.35
+            ) {
+                throw new Error(
+                    "Registration markers do not match one A5 portrait ballot."
+                );
+            }
 
             H = homography(markerPoints, marks);
 
@@ -1093,6 +1110,7 @@ exports.uploadAndProcess = async (req, res) => {
                 "Unclear shading detected. No votes saved. Retake or rescan the ballot.",
                 {
                     review_required: true,
+
                     positions,
                     unclear_positions: needsReview.map(
                         position => position.position_name
@@ -1298,6 +1316,7 @@ exports.uploadAndProcess = async (req, res) => {
 
         return res.status(200).json({
             success: true,
+
             valid: true,
             preview_only: !counting,
             counted: counting,
