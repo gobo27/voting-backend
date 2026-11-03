@@ -1,8 +1,15 @@
+
 "use strict";
 
 const db = require("../../../config/db");
 
 const PH_NOW_SQL = "(UTC_TIMESTAMP() + INTERVAL 8 HOUR)";
+
+const VALID_SCHOOL_LEVELS = [
+    "elementary",
+    "highschool",
+    "college"
+];
 
 function validId(value) {
     return Number.isSafeInteger(Number(value)) && Number(value) > 0;
@@ -10,15 +17,17 @@ function validId(value) {
 
 function fail(res, error) {
     console.error("Election archive:", error);
+
     return res.status(500).json({
         message: "Database operation failed"
     });
 }
 
-// ======================================
-// SAFE TRANSACTION
-// ======================================
+function normalizeSchoolLevel(value) {
+    return String(value || "college").trim().toLowerCase();
+}
 
+// Safe transaction para walang sabay na election creation/archive
 async function lockedTransaction(callback) {
     const conn = await db.getConnection();
     let locked = false;
@@ -57,6 +66,7 @@ async function lockedTransaction(callback) {
                 console.error("Rollback failed:", e);
             }
         }
+
         throw error;
 
     } finally {
@@ -69,20 +79,19 @@ async function lockedTransaction(callback) {
                 console.error("Release lock failed:", e);
             }
         }
+
         conn.release();
     }
 }
 
-// ======================================
-// GET ELECTION HISTORY
-// ======================================
-
+// Kunin lahat ng elections kasama ang school level
 exports.list = async (req, res) => {
     try {
         const [rows] = await db.execute(`
             SELECT
                 e.election_id,
                 e.title,
+                e.school_level,
                 e.start_time,
                 e.end_time,
                 e.status,
@@ -114,18 +123,16 @@ exports.list = async (req, res) => {
             ORDER BY e.election_id DESC
         `);
 
-        return res.json({ elections: rows });
+        return res.json({
+            elections: rows
+        });
 
     } catch (error) {
         return fail(res, error);
     }
 };
 
-// ======================================
-// VIEW ELECTION DETAILS
-// READ ONLY
-// ======================================
-
+// Read-only election details
 exports.details = async (req, res) => {
     const electionId = Number(req.params.id);
 
@@ -140,6 +147,7 @@ exports.details = async (req, res) => {
             `SELECT
                 election_id,
                 title,
+                school_level,
                 start_time,
                 end_time,
                 status,
@@ -241,10 +249,7 @@ exports.details = async (req, res) => {
     }
 };
 
-// ======================================
-// ARCHIVE ELECTION
-// ======================================
-
+// Archive election nang hindi binubura ang historical records
 exports.archive = async (req, res) => {
     const electionId = Number(req.params.id);
 
@@ -357,14 +362,15 @@ exports.archive = async (req, res) => {
     }
 };
 
-// ======================================
-// CREATE NEW ELECTION
-// ======================================
-
+// Create election na may school level
 exports.create = async (req, res) => {
     const title = String(req.body?.title || "").trim();
     const start = String(req.body?.start_time || "");
     const end = String(req.body?.end_time || "");
+
+    const schoolLevel = normalizeSchoolLevel(
+        req.body?.school_level
+    );
 
     const copyId = req.body?.copy_positions_from
         ? Number(req.body.copy_positions_from)
@@ -373,6 +379,14 @@ exports.create = async (req, res) => {
     if (!title || title.length > 150) {
         return res.status(400).json({
             message: "Title is required (max 150 characters)"
+        });
+    }
+
+    // Tatlong school levels lang ang allowed
+    if (!VALID_SCHOOL_LEVELS.includes(schoolLevel)) {
+        return res.status(400).json({
+            message:
+                "Invalid school level. Choose elementary, highschool, or college."
         });
     }
 
@@ -397,6 +411,7 @@ exports.create = async (req, res) => {
 
     try {
         const result = await lockedTransaction(async conn => {
+            // Isang current election lang ang puwede
             const [current] = await conn.query(
                 `SELECT election_id
                  FROM elections
@@ -413,9 +428,12 @@ exports.create = async (req, res) => {
                 };
             }
 
+            // I-check ang school level bago mag-copy ng positions
             if (copyId !== null) {
                 const [source] = await conn.execute(
-                    `SELECT election_id
+                    `SELECT
+                        election_id,
+                        school_level
                      FROM elections
                      WHERE election_id = ?`,
                     [copyId]
@@ -427,12 +445,26 @@ exports.create = async (req, res) => {
                         message: "Source election not found"
                     };
                 }
+
+                const sourceSchoolLevel = normalizeSchoolLevel(
+                    source[0].school_level
+                );
+
+                if (sourceSchoolLevel !== schoolLevel) {
+                    return {
+                        code: 409,
+                        message:
+                            "Cannot copy positions from a different school level."
+                    };
+                }
             }
 
+            // Save ang selected school level sa bagong election
             const [insert] = await conn.execute(
                 `INSERT INTO elections
                 (
                     title,
+                    school_level,
                     start_time,
                     end_time,
                     status,
@@ -440,10 +472,16 @@ exports.create = async (req, res) => {
                     mask_names,
                     is_current
                 )
-                VALUES (?, ?, ?, NULL, 0, 0, 1)`,
-                [title, start, end]
+                VALUES (?, ?, ?, ?, NULL, 0, 0, 1)`,
+                [
+                    title,
+                    schoolLevel,
+                    start,
+                    end
+                ]
             );
 
+            // Positions lang ang kokopyahin, hindi candidates o votes
             if (copyId !== null) {
                 await conn.execute(
                     `INSERT INTO positions
@@ -460,14 +498,18 @@ exports.create = async (req, res) => {
                         display_order
                     FROM positions
                     WHERE election_id = ?`,
-                    [insert.insertId, copyId]
+                    [
+                        insert.insertId,
+                        copyId
+                    ]
                 );
             }
 
             return {
                 code: 201,
                 message: "New election created",
-                election_id: insert.insertId
+                election_id: insert.insertId,
+                school_level: schoolLevel
             };
         });
 

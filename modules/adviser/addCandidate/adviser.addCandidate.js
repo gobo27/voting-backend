@@ -1,14 +1,48 @@
 
 const connection = require("../../../config/db");
 
-// ================= HELPERS =================
+// Valid school levels, grades, at party lists
+const SCHOOL_LEVEL_CONFIG = {
+    elementary: {
+        grades: ["3", "4", "5", "6"],
+        parties: ["LIVES", "MOVES"]
+    },
+    highschool: {
+        grades: ["7", "8", "9", "10", "11", "12"],
+        parties: ["CHAMPS", "ACTS"]
+    },
+    college: {
+        grades: ["1", "2", "3", "4"],
+        parties: ["Maroon", "White", "Independent"]
+    }
+};
 
 function validId(value) {
     const id = Number(value);
     return Number.isSafeInteger(id) && id > 0;
 }
 
-function validateCandidate(body) {
+function normalizeSchoolLevel(value) {
+    const level = String(value || "")
+        .trim()
+        .toLowerCase();
+
+    return SCHOOL_LEVEL_CONFIG[level]
+        ? level
+        : null;
+}
+
+// I-validate ang candidate ayon sa current school level
+function validateCandidate(body, schoolLevel) {
+    const config = SCHOOL_LEVEL_CONFIG[schoolLevel];
+
+    if (!config) {
+        return {
+            valid: false,
+            message: "Invalid school level for the current election"
+        };
+    }
+
     const {
         name,
         course,
@@ -20,34 +54,90 @@ function validateCandidate(body) {
     if (
         typeof name !== "string" ||
         !name.trim() ||
-        name.trim().length > 100 ||
+        name.trim().length > 100
+    ) {
+        return {
+            valid: false,
+            message: "Candidate name must be 1 to 100 characters"
+        };
+    }
+
+    if (
         typeof course !== "string" ||
         !course.trim() ||
-        course.trim().length > 255 ||
-        !["1", "2", "3", "4"].includes(String(grade_level)) ||
+        course.trim().length > 255
+    ) {
+        return {
+            valid: false,
+            message: "Course must be 1 to 255 characters"
+        };
+    }
+
+    const grade = String(grade_level ?? "").trim();
+
+    if (!config.grades.includes(grade)) {
+        return {
+            valid: false,
+            message:
+                `Invalid grade/year for ${schoolLevel}. ` +
+                `Allowed values: ${config.grades.join(", ")}`
+        };
+    }
+
+    if (
         typeof party_list !== "string" ||
         !party_list.trim() ||
-        party_list.trim().length > 100 ||
-        !validId(position_id)
+        party_list.trim().length > 100
     ) {
-        return null;
+        return {
+            valid: false,
+            message: "Invalid party list"
+        };
+    }
+
+    const selectedParty = party_list.trim();
+
+    const validParty = config.parties.find(
+        party =>
+            party.toLowerCase() ===
+            selectedParty.toLowerCase()
+    );
+
+    if (!validParty) {
+        return {
+            valid: false,
+            message:
+                `Invalid party list for ${schoolLevel}. ` +
+                `Allowed: ${config.parties.join(", ")}`
+        };
+    }
+
+    if (!validId(position_id)) {
+        return {
+            valid: false,
+            message: "Invalid position ID"
+        };
     }
 
     return {
-        name: name.trim(),
-        course: course.trim(),
-        grade_level: String(grade_level),
-        party_list: party_list.trim(),
-        position_id: Number(position_id)
+        valid: true,
+        data: {
+            name: name.trim(),
+            course: course.trim(),
+            grade_level: grade,
+            party_list: validParty,
+            position_id: Number(position_id)
+        }
     };
 }
 
-// Get current election from database
+// Kunin ang current election kasama ang school level
 async function getCurrentElection() {
     const [rows] = await connection.execute(
         `SELECT
             election_id,
             title,
+            school_level,
             status,
             is_active,
             is_current,
@@ -61,7 +151,7 @@ async function getCurrentElection() {
     return rows.length ? rows[0] : null;
 }
 
-// Candidate changes are not allowed once voting is completed.
+// Bawal mag-edit kapag active o completed na
 function canManageCandidates(election) {
     if (!election) return false;
 
@@ -78,7 +168,6 @@ function canManageCandidates(election) {
     );
 }
 
-
 function serverError(res, label, error) {
     console.error(label, error);
 
@@ -87,8 +176,7 @@ function serverError(res, label, error) {
     });
 }
 
-// ================= GET CANDIDATES =================
-
+// GET /candidates
 exports.getCandidates = async (req, res) => {
     try {
         const election = await getCurrentElection();
@@ -96,6 +184,7 @@ exports.getCandidates = async (req, res) => {
         if (!election) {
             return res.status(200).json({
                 election_id: "",
+                school_level: null,
                 candidates: [],
                 message: "No current election found"
             });
@@ -119,6 +208,7 @@ exports.getCandidates = async (req, res) => {
 
         return res.status(200).json({
             election_id: election.election_id,
+            school_level: election.school_level,
             candidates: rows
         });
 
@@ -131,18 +221,9 @@ exports.getCandidates = async (req, res) => {
     }
 };
 
-// ================= ADD CANDIDATE =================
-
+// POST /candidates
 exports.addCandidate = async (req, res) => {
     try {
-        const data = validateCandidate(req.body);
-
-        if (!data) {
-            return res.status(400).json({
-                message: "Invalid candidate information"
-            });
-        }
-
         const election = await getCurrentElection();
 
         if (!election) {
@@ -153,11 +234,29 @@ exports.addCandidate = async (req, res) => {
 
         if (!canManageCandidates(election)) {
             return res.status(409).json({
-                message: "Candidate management is locked while voting is in progress or the election has ended."
+                message:
+                    "Candidate management is locked while voting is in progress or the election has ended."
             });
         }
 
-        // Position must belong to current election.
+        const schoolLevel = normalizeSchoolLevel(
+            election.school_level
+        );
+
+        const validation = validateCandidate(
+            req.body,
+            schoolLevel
+        );
+
+        if (!validation.valid) {
+            return res.status(400).json({
+                message: validation.message
+            });
+        }
+
+        const data = validation.data;
+
+        // Siguraduhing current election ang position
         const [positions] = await connection.execute(
             `SELECT p.position_id
              FROM positions p
@@ -210,6 +309,7 @@ exports.addCandidate = async (req, res) => {
             candidate: {
                 candidate_id: result.insertId,
                 election_id: election.election_id,
+                school_level: schoolLevel,
                 ...data
             }
         });
@@ -223,22 +323,14 @@ exports.addCandidate = async (req, res) => {
     }
 };
 
-// ================= UPDATE CANDIDATE =================
-
+// PUT /candidates/:id
 exports.updateCandidate = async (req, res) => {
     try {
         const id = Number(req.params.id);
-        const data = validateCandidate(req.body);
 
         if (!validId(id)) {
             return res.status(400).json({
                 message: "Invalid candidate ID"
-            });
-        }
-
-        if (!data) {
-            return res.status(400).json({
-                message: "Invalid candidate information"
             });
         }
 
@@ -250,6 +342,23 @@ exports.updateCandidate = async (req, res) => {
                     "No editable current election available"
             });
         }
+
+        const schoolLevel = normalizeSchoolLevel(
+            election.school_level
+        );
+
+        const validation = validateCandidate(
+            req.body,
+            schoolLevel
+        );
+
+        if (!validation.valid) {
+            return res.status(400).json({
+                message: validation.message
+            });
+        }
+
+        const data = validation.data;
 
         const [candidates] = await connection.execute(
             `SELECT candidate_id, election_id
@@ -266,8 +375,8 @@ exports.updateCandidate = async (req, res) => {
         }
 
         if (
-            candidates[0].election_id !==
-            election.election_id
+            Number(candidates[0].election_id) !==
+            Number(election.election_id)
         ) {
             return res.status(403).json({
                 message:
@@ -332,6 +441,7 @@ exports.updateCandidate = async (req, res) => {
             candidate: {
                 candidate_id: id,
                 election_id: election.election_id,
+                school_level: schoolLevel,
                 ...data
             }
         });
@@ -345,8 +455,7 @@ exports.updateCandidate = async (req, res) => {
     }
 };
 
-// ================= DELETE CANDIDATE =================
-
+// DELETE /candidates/:id
 exports.deleteCandidate = async (req, res) => {
     try {
         const id = Number(req.params.id);
@@ -381,8 +490,8 @@ exports.deleteCandidate = async (req, res) => {
         }
 
         if (
-            candidates[0].election_id !==
-            election.election_id
+            Number(candidates[0].election_id) !==
+            Number(election.election_id)
         ) {
             return res.status(403).json({
                 message:
