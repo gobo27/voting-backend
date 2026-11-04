@@ -39,17 +39,80 @@ function median(values) {
         : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-
-
-async function normalizeOMRLighting(imagePath) {
-    // Basahin ang original image bilang grayscale.
-    const original = await sharp(imagePath)
+// Basahin ang original photo bilang grayscale.
+async function readOMRImage(imagePath) {
+    const result = await sharp(imagePath)
         .rotate()
         .grayscale()
         .raw()
-        .toBuffer({ resolveWithObject: true });
+        .toBuffer({
+            resolveWithObject: true
+        });
 
-    const { width, height } = original.info;
+    const { width, height } = result.info;
+
+    if (
+        width < 500 ||
+        height < 700 ||
+        result.data.length !== width * height
+    ) {
+        throw new Error(
+            "Image resolution is too low or invalid. " +
+            "Retake a clearer A5 ballot photo."
+        );
+    }
+
+    return {
+        data: result.data,
+        width,
+        height
+    };
+}
+
+// Sukatin ang exposure ng original photo.
+function measureImageExposure(image) {
+    const { data } = image;
+
+    let darkPixels = 0;
+    let brightPixels = 0;
+
+    for (let i = 0; i < data.length; i++) {
+        if (data[i] <= 5) {
+            darkPixels++;
+        }
+
+        if (data[i] >= 250) {
+            brightPixels++;
+        }
+    }
+
+    return {
+        dark_ratio: darkPixels / data.length,
+        bright_ratio: brightPixels / data.length
+    };
+}
+
+// I-correct ang shadows nang hindi sobrang pinapaputi
+// ang light pencil shading.
+async function normalizeOMRLighting(input) {
+    const original = typeof input === "string"
+        ? await readOMRImage(input)
+        : input;
+
+    if (
+        !original ||
+        !Buffer.isBuffer(original.data) ||
+        !Number.isSafeInteger(original.width) ||
+        !Number.isSafeInteger(original.height) ||
+        original.data.length !==
+            original.width * original.height
+    ) {
+        throw new Error(
+            "Invalid image supplied for lighting correction."
+        );
+    }
+
+    const { width, height } = original;
 
     const radius = Math.max(
         3,
@@ -59,7 +122,7 @@ async function normalizeOMRLighting(imagePath) {
         )
     );
 
-    // Estimate ang local brightness ng papel.
+    // Estimate ang local background brightness.
     const background = await sharp(
         original.data,
         {
@@ -74,30 +137,35 @@ async function normalizeOMRLighting(imagePath) {
         .raw()
         .toBuffer();
 
-    const normalized = Buffer.allocUnsafe(width * height);
+    const normalized = Buffer.allocUnsafe(
+        width * height
+    );
 
-    let darkPixels = 0;
-    let brightPixels = 0;
+    const quality = measureImageExposure(original);
 
-    // Sukatin ang exposure sa original image.
-    for (let i = 0; i < original.data.length; i++) {
-        const value = original.data[i];
-
-        if (value <= 5) darkPixels++;
-        if (value >= 250) brightPixels++;
-    }
+    // Blend ang original at corrected pixels.
+    // Para hindi mawala agad ang mahihinang shading.
+    const correctionStrength = 0.40;
+    const targetBrightness = 205;
 
     for (let i = 0; i < normalized.length; i++) {
         const pixel = original.data[i];
         const localLight = background[i];
 
-        // Moderate correction para hindi mawala ang light shades.
         const corrected =
-            205 + (pixel - localLight) * 1.15;
+            targetBrightness +
+            (pixel - localLight) * 1.15;
+
+        const blended =
+            pixel * (1 - correctionStrength) +
+            corrected * correctionStrength;
 
         normalized[i] = Math.max(
             0,
-            Math.min(255, Math.round(corrected))
+            Math.min(
+                255,
+                Math.round(blended)
+            )
         );
     }
 
@@ -105,14 +173,235 @@ async function normalizeOMRLighting(imagePath) {
         data: normalized,
         width,
         height,
-        quality: {
-            dark_ratio: darkPixels / original.data.length,
-            bright_ratio: brightPixels / original.data.length
-        }
+        quality
     };
 }
 
+// Kumuha ng grayscale pixel gamit ang bilinear sampling.
+function sampleGrayBilinear(image, x, y) {
+    if (
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        x < 0 ||
+        y < 0 ||
+        x >= image.width - 1 ||
+        y >= image.height - 1
+    ) {
+        return null;
+    }
 
+    const x0 = Math.floor(x);
+    const y0 = Math.floor(y);
+
+    const fx = x - x0;
+    const fy = y - y0;
+
+    const index = y0 * image.width + x0;
+
+    const p00 = image.data[index];
+    const p10 = image.data[index + 1];
+    const p01 = image.data[index + image.width];
+    const p11 = image.data[index + image.width + 1];
+
+    const top = p00 * (1 - fx) + p10 * fx;
+    const bottom = p01 * (1 - fx) + p11 * fx;
+
+    return Math.round(
+        top * (1 - fy) + bottom * fy
+    );
+}
+
+ // I-validate ang four registration markers.
+function validateMarkerQuadrilateral(marks) {
+    if (
+        !Array.isArray(marks) ||
+        marks.length !== 4 ||
+        !marks.every(point =>
+            point &&
+            Number.isFinite(point.x) &&
+            Number.isFinite(point.y)
+        )
+    ) {
+        throw new Error(
+            "Four valid registration markers are required."
+        );
+    }
+
+    const [tl, tr, bl, br] = marks;
+
+    const distance = (a, b) =>
+        Math.hypot(
+            a.x - b.x,
+            a.y - b.y
+        );
+
+    const top = distance(tl, tr);
+    const bottom = distance(bl, br);
+    const left = distance(tl, bl);
+    const right = distance(tr, br);
+
+    if (
+        Math.min(top, bottom, left, right) < 100
+    ) {
+        throw new Error(
+            "Registration markers are too close together."
+        );
+    }
+
+    const cross = (a, b, c) =>
+        (b.x - a.x) * (c.y - a.y) -
+        (b.y - a.y) * (c.x - a.x);
+
+    const polygon = [tl, tr, br, bl];
+
+    const turns = polygon.map((point, i) =>
+        cross(
+            point,
+            polygon[(i + 1) % 4],
+            polygon[(i + 2) % 4]
+        )
+    );
+
+    if (
+        turns.some(value => Math.abs(value) < 1) ||
+        !turns.every(value => value > 0) &&
+        !turns.every(value => value < 0)
+    ) {
+        throw new Error(
+            "Registration markers do not form " +
+            "a valid ballot quadrilateral."
+        );
+    }
+
+    const measuredRatio =
+        ((top + bottom) / 2) /
+        ((left + right) / 2);
+
+    const expectedRatio =
+        (138.5 - 9.5) /
+        (200.5 - 7.5);
+
+    if (
+        !Number.isFinite(measuredRatio) ||
+        Math.abs(measuredRatio - expectedRatio) > 0.22 ||
+        Math.abs(top - bottom) /
+            Math.max(top, bottom) > 0.35 ||
+        Math.abs(left - right) /
+            Math.max(left, right) > 0.35
+    ) {
+        throw new Error(
+            "Registration markers do not match " +
+            "one A5 portrait ballot."
+        );
+    }
+
+    return true;
+}
+
+// Gumawa ng perspective-corrected A5 image.
+// Marker-based ang alignment, hindi manual crop.
+function rectifyA5Ballot(image, marks) {
+    validateMarkerQuadrilateral(marks);
+
+    const paper = PAPER_DIMENSIONS.A5;
+
+    const markerPoints = [
+        { x: mm(9.5), y: mm(7.5) },
+        { x: mm(138.5), y: mm(7.5) },
+        { x: mm(9.5), y: mm(200.5) },
+        { x: mm(138.5), y: mm(200.5) }
+    ];
+
+    // Existing homography() at project() functions
+    // ay nasa kasunod na section ng controller.
+    const H = homography(markerPoints, marks);
+
+    const output = Buffer.alloc(
+        paper.width * paper.height,
+        255
+    );
+
+    let missingSamples = 0;
+
+    // Map each A5 pixel pabalik sa original photo.
+    for (let y = 0; y < paper.height; y++) {
+        const row = y * paper.width;
+
+        for (let x = 0; x < paper.width; x++) {
+            const point = project(H, x, y);
+
+            const value = point
+                ? sampleGrayBilinear(
+                    image,
+                    point.x,
+                    point.y
+                )
+                : null;
+
+            if (value === null) {
+                missingSamples++;
+                continue;
+            }
+
+            output[row + x] = value;
+        }
+    }
+
+    const missingRatio =
+        missingSamples / output.length;
+
+    // Huwag magbilang kapag maraming image pixels
+    // ang wala sa captured photo.
+    if (missingRatio > 0.005) {
+        throw new Error(
+            "Part of the A5 ballot is outside the photo. " +
+            "Retake with the entire paper visible."
+        );
+    }
+
+    return {
+        data: output,
+        width: paper.width,
+        height: paper.height,
+        quality: {
+            missing_ratio: missingRatio
+        },
+        markers: markerPoints,
+        homography: H
+    };
+}
+
+// Convert ang corrected grayscale ballot to JPEG.
+// Para sa preview endpoint sa susunod na parts.
+async function encodeCorrectedBallot(image) {
+    if (
+        !image ||
+        !image.data ||
+        !Number.isSafeInteger(image.width) ||
+        !Number.isSafeInteger(image.height) ||
+        image.data.length !== image.width * image.height
+    ) {
+        throw new Error(
+            "Invalid corrected ballot image."
+        );
+    }
+
+    return sharp(
+        image.data,
+        {
+            raw: {
+                width: image.width,
+                height: image.height,
+                channels: 1
+            }
+        }
+    )
+        .jpeg({
+            quality: 92,
+            mozjpeg: true
+        })
+        .toBuffer();
+}
 
 function parseQR(qrData) {
     const parts = String(qrData || "")
@@ -120,7 +409,7 @@ function parseQR(qrData) {
         .split("|");
 
     const uuidPattern =
-        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     if (
         parts.length !== 4 ||
@@ -141,69 +430,235 @@ function parseQR(qrData) {
     };
 }
 
-async function readBallotQR(imagePath) {
-    const { data, info } = await sharp(imagePath)
-        .rotate()
+// Basahin ang QR sa isang image buffer.
+function decodeQRBuffer(data, width, height) {
+    if (
+        !data ||
+        width < 21 ||
+        height < 21 ||
+        data.length !== width * height * 4
+    ) {
+        return null;
+    }
+
+    const result = jsQR(
+        new Uint8ClampedArray(data),
+        width,
+        height,
+        {
+            inversionAttempts: "attemptBoth"
+        }
+    );
+
+    if (
+        !result ||
+        typeof result.data !== "string" ||
+        !result.data.trim()
+    ) {
+        return null;
+    }
+
+    // I-validate ang QR format bago tanggapin.
+    try {
+        return parseQR(result.data);
+    } catch (_) {
+        return null;
+    }
+}
+
+// Convert grayscale to RGBA para sa jsQR.
+async function grayscaleToQRImage(image) {
+    const result = await sharp(
+        image.data,
+        {
+            raw: {
+                width: image.width,
+                height: image.height,
+                channels: 1
+            }
+        }
+    )
         .ensureAlpha()
         .raw()
         .toBuffer({
             resolveWithObject: true
         });
 
-    let result = jsQR(
-        new Uint8ClampedArray(data),
-        info.width,
-        info.height,
-        {
-            inversionAttempts: "attemptBoth"
+    return {
+        data: result.data,
+        width: result.info.width,
+        height: result.info.height
+    };
+}
+
+// Subukan ang iba't ibang image sizes.
+
+async function scanQRAtMultipleSizes(imageBuffer) {
+    const sizes = [
+        null,
+        1600,
+        1000
+    ];
+
+    for (const size of sizes) {
+        let pipeline = sharp(imageBuffer);
+
+        if (size !== null) {
+            pipeline = pipeline.resize({
+                width: size,
+                withoutEnlargement: true
+            });
         }
-    );
 
-    if (!result) {
-        const cropX = Math.floor(
-            info.width * 0.65
-        );
-
-        const cropWidth =
-            info.width - cropX;
-
-        const cropHeight = Math.max(
-            1,
-            Math.floor(info.height * 0.40)
-        );
-
-        const crop = await sharp(imagePath)
-            .rotate()
-            .extract({
-                left: cropX,
-                top: 0,
-                width: cropWidth,
-                height: cropHeight
-            })
+        const result = await pipeline
             .ensureAlpha()
             .raw()
             .toBuffer({
                 resolveWithObject: true
             });
 
-        result = jsQR(
-            new Uint8ClampedArray(crop.data),
-            crop.info.width,
-            crop.info.height,
-            {
-                inversionAttempts: "attemptBoth"
-            }
+        const decoded = decodeQRBuffer(
+            result.data,
+            result.info.width,
+            result.info.height
         );
+
+        if (decoded) {
+            return decoded;
+        }
     }
 
-    if (!result) {
-        throw new Error(
-            "QR code not detected. No votes recorded."
-        );
-    }
-
-    return parseQR(result.data);
+    return null;
 }
+
+// Hanapin ang QR sa full image at upper-right.
+async function scanQRRegions(imageBuffer) {
+    const metadata = await sharp(imageBuffer).metadata();
+
+    const width = metadata.width;
+    const height = metadata.height;
+
+    if (
+        !Number.isSafeInteger(width) ||
+        !Number.isSafeInteger(height) ||
+        width < 100 ||
+        height < 100
+    ) {
+        return null;
+    }
+
+    // Unahin ang full image.
+    const fullResult = await scanQRAtMultipleSizes(
+        imageBuffer
+    );
+
+    if (fullResult) {
+        return fullResult;
+    }
+
+    // QR ng A5 ballot ay nasa upper-right region.
+    const regions = [
+        {
+            left: Math.floor(width * 0.55),
+            top: 0,
+            width: width - Math.floor(width * 0.55),
+            height: Math.max(
+                1,
+                Math.floor(height * 0.45)
+            )
+        },
+        {
+            left: Math.floor(width * 0.65),
+            top: 0,
+            width: width - Math.floor(width * 0.65),
+            height: Math.max(
+                1,
+                Math.floor(height * 0.35)
+            )
+        }
+    ];
+
+    for (const region of regions) {
+        const cropped = await sharp(imageBuffer)
+            .extract(region)
+            .png()
+            .toBuffer();
+
+        const decoded = await scanQRAtMultipleSizes(
+            cropped
+        );
+
+        if (decoded) {
+            return decoded;
+        }
+    }
+
+    return null;
+}
+
+// Original photo muna, corrected image bilang fallback.
+async function readBallotQR(imagePath, correctedImage = null) {
+    // I-apply ang EXIF orientation ng phone photo.
+    const originalBuffer = await sharp(imagePath)
+        .rotate()
+        .png()
+        .toBuffer();
+
+    let result = await scanQRRegions(originalBuffer);
+
+    if (result) {
+        return result;
+    }
+
+    // Gamitin ang corrected image kung available.
+    if (correctedImage) {
+        const correctedBuffer =
+            await encodeCorrectedBallot(correctedImage);
+
+        result = await scanQRRegions(
+            correctedBuffer
+        );
+
+        if (result) {
+            return result;
+        }
+    }
+
+    // Fallback: lighting correction ng original photo.
+    const normalized = await normalizeOMRLighting(
+        imagePath
+    );
+
+    const normalizedBuffer = await sharp(
+        normalized.data,
+        {
+            raw: {
+                width: normalized.width,
+                height: normalized.height,
+                channels: 1
+            }
+        }
+    )
+        .png()
+        .toBuffer();
+
+    result = await scanQRRegions(
+        normalizedBuffer
+    );
+
+    if (result) {
+        return result;
+    }
+
+    // Hindi valid ang QR: hindi magbibilang.
+    throw new Error(
+        "QR code not detected. Retake a clearer photo " +
+        "with the entire A5 ballot visible. No votes recorded."
+    );
+}
+
+// taga kuha ng template at original bubble coordinates.
+
 
 async function getTemplateCoordinates(
     db,
@@ -269,30 +724,35 @@ async function getTemplateCoordinates(
 
 // REGISTRATION MARKERS
 
+// Hanapin ang apat na registration squares sa A5 photo.
 async function findMarkers(
     normalizedImage,
     originalWidth,
     originalHeight
 ) {
+    if (
+        !normalizedImage ||
+        !normalizedImage.data ||
+        !validId(normalizedImage.width) ||
+        !validId(normalizedImage.height) ||
+        normalizedImage.data.length !==
+            normalizedImage.width * normalizedImage.height
+    ) {
+        throw new Error("Invalid image for marker detection.");
+    }
+
     const scale = Math.min(
         1,
         1100 / Math.max(
-            originalWidth,
-            originalHeight
+            normalizedImage.width,
+            normalizedImage.height
         )
     );
 
-    const w = Math.max(
-        1,
-        Math.round(originalWidth * scale)
-    );
+    const w = Math.round(normalizedImage.width * scale);
+    const h = Math.round(normalizedImage.height * scale);
 
-    const h = Math.max(
-        1,
-        Math.round(originalHeight * scale)
-    );
-
-    const { data } = await sharp(
+    const resized = await sharp(
         normalizedImage.data,
         {
             raw: {
@@ -302,58 +762,29 @@ async function findMarkers(
             }
         }
     )
-        .resize(w, h, {
-            fit: "fill"
-        })
+        .resize(w, h)
         .raw()
-        .toBuffer({
-            resolveWithObject: true
-        });
+        .toBuffer({ resolveWithObject: true });
 
+    const data = resized.data;
 
-    const mask = new Uint8Array(w * h);
-    const seen = new Uint8Array(w * h);
+    // Subukan ang ilang thresholds para sa shadows.
+    const thresholds = [90, 115, 140];
+    const candidates = [];
 
-    for (let i = 0; i < mask.length; i++) {
-        mask[i] = data[i] < 115 ? 1 : 0;
-    }
+    for (const threshold of thresholds) {
+        const mask = new Uint8Array(w * h);
+        const seen = new Uint8Array(w * h);
 
-    const corners = [
-        [0, 0],
-        [w - 1, 0],
-        [0, h - 1],
-        [w - 1, h - 1]
-    ];
+        for (let i = 0; i < mask.length; i++) {
+            mask[i] = data[i] < threshold ? 1 : 0;
+        }
 
-    const found = [];
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const start = y * w + x;
 
-    for (const [cx, cy] of corners) {
-        const x0 = cx === 0
-            ? 0
-            : Math.floor(w * 0.66);
-
-        const x1 = cx === 0
-            ? Math.ceil(w * 0.34)
-            : w;
-
-        const y0 = cy === 0
-            ? 0
-            : Math.floor(h * 0.66);
-
-        const y1 = cy === 0
-            ? Math.ceil(h * 0.34)
-            : h;
-
-        let best = null;
-
-        for (let yy = y0; yy < y1; yy++) {
-            for (let xx = x0; xx < x1; xx++) {
-                const start = yy * w + xx;
-
-                if (
-                    !mask[start] ||
-                    seen[start]
-                ) {
+                if (!mask[start] || seen[start]) {
                     continue;
                 }
 
@@ -361,170 +792,266 @@ async function findMarkers(
                 seen[start] = 1;
 
                 let area = 0;
+                let sumX = 0;
+                let sumY = 0;
+                let minX = x;
+                let maxX = x;
+                let minY = y;
+                let maxY = y;
 
-                let minX = xx;
-                let maxX = xx;
-                let minY = yy;
-                let maxY = yy;
-
-                let sx = 0;
-                let sy = 0;
-
+                // Connected-component detection.
                 while (stack.length) {
-                    const n = stack.pop();
-
-                    const px = n % w;
-                    const py = Math.floor(n / w);
+                    const index = stack.pop();
+                    const px = index % w;
+                    const py = Math.floor(index / w);
 
                     area++;
-                    sx += px;
-                    sy += py;
+                    sumX += px;
+                    sumY += py;
 
                     minX = Math.min(minX, px);
                     maxX = Math.max(maxX, px);
                     minY = Math.min(minY, py);
                     maxY = Math.max(maxY, py);
 
-                    if (px > x0) {
-                        const q = n - 1;
+                    const neighbors = [];
 
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
-                            seen[q] = 1;
-                            stack.push(q);
-                        }
+                    if (px > 0) {
+                        neighbors.push(index - 1);
                     }
 
-                    if (px + 1 < x1) {
-                        const q = n + 1;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
-                            seen[q] = 1;
-                            stack.push(q);
-                        }
+                    if (px + 1 < w) {
+                        neighbors.push(index + 1);
                     }
 
-                    if (py > y0) {
-                        const q = n - w;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
-                            seen[q] = 1;
-                            stack.push(q);
-                        }
+                    if (py > 0) {
+                        neighbors.push(index - w);
                     }
 
-                    if (py + 1 < y1) {
-                        const q = n + w;
+                    if (py + 1 < h) {
+                        neighbors.push(index + w);
+                    }
 
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
-                            seen[q] = 1;
-                            stack.push(q);
+                    for (const next of neighbors) {
+                        if (mask[next] && !seen[next]) {
+                            seen[next] = 1;
+                            stack.push(next);
                         }
                     }
                 }
 
                 const bw = maxX - minX + 1;
                 const bh = maxY - minY + 1;
-
                 const ratio = bw / bh;
                 const density = area / (bw * bh);
 
+                // Reject text, lines at malalaking shadows.
                 if (
-                    area < 8 ||
-                    bw < 3 ||
-                    bh < 3 ||
-                    bw > w * 0.08 ||
-                    bh > h * 0.08 ||
-                    ratio < 0.6 ||
-                    ratio > 1.65 ||
-                    density < 0.72
+                    area < 12 ||
+                    bw < 4 ||
+                    bh < 4 ||
+                    bw > w * 0.065 ||
+                    bh > h * 0.065 ||
+                    ratio < 0.65 ||
+                    ratio > 1.55 ||
+                    density < 0.70
                 ) {
                     continue;
                 }
 
-                const mx = sx / area;
-                const my = sy / area;
+                const cx = sumX / area;
+                const cy = sumY / area;
 
-                const distance = Math.hypot(
-                    mx - cx,
-                    my - cy
-                );
-
-                const score = area / (
-                    1 + distance
-                );
+                // Registration squares dapat nasa outer
+                // region ng ballot, hindi sa gitna.
+                const nearLeft = cx < w * 0.43;
+                const nearRight = cx > w * 0.57;
+                const nearTop = cy < h * 0.43;
+                const nearBottom = cy > h * 0.57;
 
                 if (
-                    !best ||
-                    score > best.score
+                    !(nearLeft || nearRight) ||
+                    !(nearTop || nearBottom)
                 ) {
-                    best = {
-                        x: mx / scale,
-                        y: my / scale,
-                        score
-                    };
+                    continue;
                 }
+
+                // Merge candidates mula sa iba-ibang thresholds.
+                const duplicate = candidates.some(item =>
+                    Math.hypot(
+                        item.x - cx,
+                        item.y - cy
+                    ) < Math.max(5, Math.min(bw, bh) * 0.5)
+                );
+
+                if (duplicate) {
+                    continue;
+                }
+
+                candidates.push({
+                    x: cx,
+                    y: cy,
+                    width: bw,
+                    height: bh,
+                    area,
+                    density,
+                    score: density * Math.min(bw, bh)
+                });
             }
         }
-
-        if (!best) {
-            throw new Error(
-                "Four registration squares not detected. " +
-                "Keep all four corners visible."
-            );
-        }
-
-        found.push(best);
     }
 
-    const [tl, tr, bl, br] = found;
+    // Hatiin sa apat na regions.
+    const regions = [
+        candidates.filter(p =>
+            p.x < w * 0.5 && p.y < h * 0.5
+        ),
+        candidates.filter(p =>
+            p.x >= w * 0.5 && p.y < h * 0.5
+        ),
+        candidates.filter(p =>
+            p.x < w * 0.5 && p.y >= h * 0.5
+        ),
+        candidates.filter(p =>
+            p.x >= w * 0.5 && p.y >= h * 0.5
+        )
+    ];
 
-    const topWidth = Math.hypot(
-        tr.x - tl.x,
-        tr.y - tl.y
-    );
-
-    const bottomWidth = Math.hypot(
-        br.x - bl.x,
-        br.y - bl.y
-    );
-
-    const leftHeight = Math.hypot(
-        bl.x - tl.x,
-        bl.y - tl.y
-    );
-
-    const rightHeight = Math.hypot(
-        br.x - tr.x,
-        br.y - tr.y
-    );
-
-    if (
-        topWidth < originalWidth * 0.45 ||
-        bottomWidth < originalWidth * 0.45 ||
-        leftHeight < originalHeight * 0.45 ||
-        rightHeight < originalHeight * 0.45
-    ) {
+    if (regions.some(region => region.length === 0)) {
         throw new Error(
-            "Registration markers are too close together."
+            "Four registration squares not detected. " +
+            "Retake with all four corners visible."
         );
     }
 
-    return [tl, tr, bl, br];
+    // Unahin ang mas malalaking, solid na squares.
+    const shortlist = regions.map(region =>
+        region
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 12)
+    );
+
+    const expectedRatio =
+        (138.5 - 9.5) / (200.5 - 7.5);
+
+    const distance = (a, b) =>
+        Math.hypot(a.x - b.x, a.y - b.y);
+
+    let best = null;
+    let bestScore = -Infinity;
+    let secondBestScore = -Infinity;
+
+    // Piliin ang best matching four-marker group.
+    for (const tl of shortlist[0]) {
+        for (const tr of shortlist[1]) {
+            for (const bl of shortlist[2]) {
+                for (const br of shortlist[3]) {
+                    const top = distance(tl, tr);
+                    const bottom = distance(bl, br);
+                    const left = distance(tl, bl);
+                    const right = distance(tr, br);
+
+                    const minSide = Math.min(
+                        top, bottom, left, right
+                    );
+
+                    if (
+                        minSide < Math.min(w, h) * 0.30
+                    ) {
+                        continue;
+                    }
+
+                    const ratio =
+                        ((top + bottom) / 2) /
+                        ((left + right) / 2);
+
+                    const widthDifference =
+                        Math.abs(top - bottom) /
+                        Math.max(top, bottom);
+
+                    const heightDifference =
+                        Math.abs(left - right) /
+                        Math.max(left, right);
+
+                    if (
+                        Math.abs(ratio - expectedRatio) > 0.22 ||
+                        widthDifference > 0.35 ||
+                        heightDifference > 0.35
+                    ) {
+                        continue;
+                    }
+
+                    const points = [tl, tr, bl, br];
+
+                    try {
+                        validateMarkerQuadrilateral(points);
+                    } catch (_) {
+                        continue;
+                    }
+
+                    const sizes = points.map(p =>
+                        Math.sqrt(p.width * p.height)
+                    );
+
+                    const minSize = Math.min(...sizes);
+                    const maxSize = Math.max(...sizes);
+
+                    if (
+                        minSize < 4 ||
+                        maxSize / minSize > 2.5
+                    ) {
+                        continue;
+                    }
+
+                    const areaScore =
+                        points.reduce(
+                            (sum, p) => sum + p.score,
+                            0
+                        );
+
+                    const geometryPenalty =
+                        Math.abs(ratio - expectedRatio) * 100 +
+                        widthDifference * 50 +
+                        heightDifference * 50;
+
+                    const sizePenalty =
+                        (maxSize / minSize - 1) * 10;
+
+                    const score =
+                        areaScore -
+                        geometryPenalty -
+                        sizePenalty;
+
+                    if (score > bestScore) {
+                        secondBestScore = bestScore;
+                        bestScore = score;
+                        best = points;
+                    } else if (score > secondBestScore) {
+                        secondBestScore = score;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!best) {
+        throw new Error(
+            "Registration markers found, but alignment " +
+            "does not match an A5 portrait ballot."
+        );
+    }
+    const marks = best.map(point => ({
+        x: point.x / scale,
+        y: point.y / scale
+    }));
+
+    validateMarkerQuadrilateral(marks);
+
+    return marks;
 }
 
-/* HOMOGRAPHY AND COORDINATE ALIGNMENT */
+// Solve ang eight homography parameters.
+
 
 function solve8(A, b) {
     for (let i = 0; i < 8; i++) {
@@ -561,13 +1088,13 @@ function solve8(A, b) {
             }
 
             b[j] -= factor * b[i];
-
         }
     }
 
     return b;
 }
 
+// Map template coordinates papunta sa photo.
 function homography(from, to) {
     const A = [];
     const b = [];
@@ -598,6 +1125,7 @@ function homography(from, to) {
     return solve8(A, b);
 }
 
+// Project coordinates gamit ang homography.
 function project(H, x, y) {
     const d = H[6] * x + H[7] * y + 1;
 
@@ -620,6 +1148,7 @@ function project(H, x, y) {
     };
 }
 
+// Sample ng original image pixel.
 function sample(image, H, x, y) {
     const point = project(H, x, y);
 
@@ -644,8 +1173,7 @@ function sample(image, H, x, y) {
     ];
 }
 
-/* OMR BUBBLE DETECTION */
-
+// OMR BUBBLE DETECTION
 
 function measure(image, H, coordinate, sensitivity, dimensions) {
     const x = Number(coordinate.x_pos);
@@ -671,8 +1199,7 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
     const inside = [];
     const paper = [];
 
-    // Sample only the inner bubble area.
-    // Iwasan ang printed outline ng bilog.
+    // Sukatin ang loob, iwas sa printed outline.
     for (let j = -16; j <= 16; j++) {
         for (let i = -16; i <= 16; i++) {
             const r = Math.hypot(i / 16, j / 16);
@@ -692,7 +1219,7 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         }
     }
 
-    // Sample nearby paper for local brightness.
+    // Nearby paper ang brightness reference.
     for (let j = -20; j <= 20; j++) {
         for (let i = -20; i <= 20; i++) {
             const r = Math.hypot(i / 20, j / 20);
@@ -712,7 +1239,7 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         }
     }
 
-    // Reject incomplete samples instead of guessing.
+    // Kapag kulang ang samples, retake muna.
     if (inside.length < 80 || paper.length < 20) {
         throw new Error(
             "Insufficient bubble samples. Retake the photo."
@@ -736,7 +1263,7 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         0
     ) / differences.length;
 
-    // Sensitivity settings are initial calibration values.
+    // Initial thresholds, kailangan ng real-ballot calibration.
     const settings = {
         1: {
             contrast: 30,
@@ -771,14 +1298,13 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         average >= setting.minimum &&
         marked >= setting.requiredMarked;
 
-    // Borderline shading: huwag basta ituring na blank.
+    // Borderline shading, hindi agad blank.
     const possibleShade =
         average >= setting.uncertainAverage &&
         marked >= setting.uncertainMarked;
 
     const unclear = !selected && possibleShade;
 
-    // Detect weak local contrast in the bubble area.
     const sortedInside = [...inside].sort((a, b) => a - b);
 
     const p10 = sortedInside[
@@ -810,20 +1336,25 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
 
 function validatePositionVotes(grouped) {
     const positions = [...grouped.values()].map(position => {
-        const markedCandidates = position.candidates.filter(candidate => candidate.filled);
+        const markedCandidates = position.candidates.filter(
+            candidate => candidate.filled
+        );
+
         const marked = markedCandidates.length;
         const overvoted = marked > position.max_selection;
-        const unclear = position.candidates.some(candidate => candidate.unclear);
 
-        // Never silently discard confirmed votes because a bubble is ambiguous.
-        // Ambiguous positions require a clearer scan before the ballot is finalized.
+        const unclear = position.candidates.some(
+            candidate => candidate.unclear
+        );
+
+        // Preserve ang original overvote at undervote rules.
         let result = "BLANK";
+
         if (overvoted) {
             result = "SKIPPED_OVERVOTE";
         } else if (unclear) {
             result = "NEEDS_REVIEW";
         } else if (marked > 0) {
-
             result = "COUNTED";
         }
 
@@ -849,15 +1380,19 @@ function validatePositionVotes(grouped) {
             : []
     );
 
-    return { positions, votes };
+    return {
+        positions,
+        votes
+    };
 }
 
 /* CANDIDATE BUBBLE ANALYSIS */
 
-
 function analyzeBubbleCoordinates(image, H, coordinates, paper) {
     if (!Array.isArray(coordinates) || !coordinates.length) {
-        throw new Error("No saved bubble coordinates found.");
+        throw new Error(
+            "No saved bubble coordinates found."
+        );
     }
 
     const grouped = new Map();
@@ -881,7 +1416,7 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
 
         seen.add(candidateId);
 
-        // Measure the bubble using local brightness.
+        // Measure gamit ang local brightness.
         const measurement = measure(
             image,
             H,
@@ -907,7 +1442,7 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
             );
         }
 
-        // Uncertain shades trigger existing retake protection.
+        // Uncertain shading ay para sa retake gate.
         const unclear = measurement.unclear === true;
 
         position.candidates.push({
@@ -931,10 +1466,8 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
         });
     }
 
-    // Existing position validation remains unchanged.
     return validatePositionVotes(grouped);
 }
-
 
 /* QR VERIFICATION */
 
@@ -1044,26 +1577,198 @@ exports.uploadAndProcess = async (req, res) => {
             return fail(403, "Invalid OMR processing mode.");
         }
 
-        if (counting && process.env.OMR_COUNTING_ENABLED !== "true") {
+        if (
+            counting &&
+            process.env.OMR_COUNTING_ENABLED !== "true"
+        ) {
             return fail(403, "Live counting is disabled.");
         }
 
         const electionId = Number(req.body?.election_id);
         const templateId = Number(req.body?.template_id);
 
-        if (!req.file?.path || !validId(electionId) || !validId(templateId)) {
+        if (
+            !req.file?.path ||
+            !validId(electionId) ||
+            !validId(templateId)
+        ) {
             return fail(
                 400,
                 "Ballot image, election ID and template ID are required."
             );
         }
 
-        let qr;
+        // Basahin muna ang original image.
+        let originalImage;
+
+        try {
+            originalImage = await readOMRImage(req.file.path);
+        } catch (error) {
+            return fail(
+                422,
+                "Invalid ballot photo. " + error.message,
+                {
+                    retake_required: true,
+                    quality_issue: "IMAGE"
+                }
+            );
+        }
+
+        const info = {
+            width: originalImage.width,
+            height: originalImage.height
+        };
+
+        // Unang QR attempt sa original photo.
+        // Kapag pumalya, susubukan ulit after crop.
+        let qr = null;
 
         try {
             qr = await readBallotQR(req.file.path);
         } catch (error) {
-            return fail(422, error.message);
+            console.warn(
+                "Initial QR detection failed:",
+                error.message
+            );
+        }
+
+        // Hanapin ang registration markers.
+        // Subukan ang original at normalized image.
+        let marks = null;
+        let markerError = null;
+
+        try {
+            marks = await findMarkers(
+                originalImage,
+                info.width,
+                info.height
+            );
+        } catch (error) {
+            markerError = error;
+        }
+
+        if (!marks) {
+            try {
+                const normalized = await normalizeOMRLighting(
+                    originalImage
+                );
+
+                marks = await findMarkers(
+                    normalized,
+                    normalized.width,
+                    normalized.height
+                );
+
+                markerError = null;
+            } catch (error) {
+                markerError = error;
+            }
+        }
+
+        if (!marks || marks.length !== 4) {
+            return fail(
+                422,
+                "Alignment failed. Retake the photo. " +
+                (markerError?.message ||
+                    "Four registration markers not detected."),
+                {
+                    retake_required: true,
+                    quality_issue: "ALIGNMENT"
+                }
+            );
+        }
+
+        // I-validate ang marker geometry.
+        try {
+            validateMarkerQuadrilateral(marks);
+        } catch (error) {
+            return fail(
+                422,
+                "Invalid A5 alignment. " + error.message,
+                {
+                    retake_required: true,
+                    quality_issue: "ALIGNMENT"
+                }
+            );
+        }
+
+        // Automatic perspective crop.
+        // Original grayscale ang ginagamit para
+        // mapanatili ang pencil shading.
+        let croppedBallot;
+
+        try {
+            croppedBallot = rectifyA5Ballot(
+                originalImage,
+                marks
+            );
+        } catch (error) {
+            return fail(
+                422,
+                "Automatic crop failed. " + error.message,
+                {
+                    retake_required: true,
+                    quality_issue: "CROP"
+                }
+            );
+        }
+
+        // Exposure check sa cropped paper, hindi
+        // sa background ng original camera photo.
+        const exposure = measureImageExposure(
+            croppedBallot
+        );
+
+        if (
+            exposure.dark_ratio > 0.50 ||
+            exposure.bright_ratio > 0.80
+        ) {
+            return fail(
+                422,
+                "Poor ballot exposure. Retake with even lighting. " +
+                "No votes saved.",
+                {
+                    retake_required: true,
+                    quality_issue: "EXPOSURE"
+                }
+            );
+        }
+
+        // Lighting correction pagkatapos ng crop.
+        let correctedBallot;
+
+        try {
+            correctedBallot = await normalizeOMRLighting(
+                croppedBallot
+            );
+        } catch (error) {
+            return fail(
+                422,
+                "Lighting correction failed. " + error.message,
+                {
+                    retake_required: true,
+                    quality_issue: "LIGHTING"
+                }
+            );
+        }
+
+        // QR fallback gamit ang cropped ballot.
+        if (!qr) {
+            try {
+                qr = await readBallotQR(
+                    req.file.path,
+                    correctedBallot
+                );
+            } catch (error) {
+                return fail(
+                    422,
+                    "QR verification failed. " + error.message,
+                    {
+                        retake_required: true,
+                        quality_issue: "QR"
+                    }
+                );
+            }
         }
 
         if (
@@ -1076,6 +1781,8 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
+        // Check ballot eligibility.
+
         db = await pool.getConnection();
 
         const [ballots] = await db.execute(
@@ -1085,7 +1792,11 @@ exports.uploadAndProcess = async (req, res) => {
                AND election_id = ?
                AND template_id = ?
              LIMIT 1`,
-            [qr.ballot_id, electionId, templateId]
+            [
+                qr.ballot_id,
+                electionId,
+                templateId
+            ]
         );
 
         if (!ballots.length) {
@@ -1095,12 +1806,17 @@ exports.uploadAndProcess = async (req, res) => {
         const ballotStatus = ballots[0].status;
 
         if (!["ISSUED", "CAST"].includes(ballotStatus)) {
-            return fail(409, "Ballot is not eligible for scanning.", {
-                status: ballotStatus,
-                duplicate: ballotStatus === "COUNTED"
-            });
+            return fail(
+                409,
+                "Ballot is not eligible for scanning.",
+                {
+                    status: ballotStatus,
+                    duplicate: ballotStatus === "COUNTED"
+                }
+            );
         }
 
+        // Kunin ang original template coordinates.
         const record = await getTemplateCoordinates(
             db,
             templateId,
@@ -1116,14 +1832,20 @@ exports.uploadAndProcess = async (req, res) => {
         ).toUpperCase();
 
         if (paperSize !== "A5") {
-            return fail(422, "Only A5 portrait ballots are supported.");
+            return fail(
+                422,
+                "Only A5 portrait ballots are supported."
+            );
         }
 
         if (
             !Array.isArray(record.coordinates) ||
             !record.coordinates.length
         ) {
-            return fail(422, "No saved bubble coordinates found.");
+            return fail(
+                422,
+                "No saved bubble coordinates found."
+            );
         }
 
         const paper = PAPER_DIMENSIONS.A5;
@@ -1140,124 +1862,57 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
-        const image = await normalizeOMRLighting(
-            req.file.path
-        );
-
-        const info = {
-            width: image.width,
-            height: image.height
-        };
-        if (
-            image.quality.dark_ratio > 0.50 ||
-            image.quality.bright_ratio > 0.80
-        ) {
-            return fail(
-                422,
-                "Poor image exposure. Retake the photo " +
-                "with more even lighting. No votes saved.",
-                {
-                    retake_required: true,
-                    quality_issue: "EXPOSURE"
-                }
-            );
-        }
-
-
-        if (info.width < 500 || info.height < 700) {
-            return fail(
-                422,
-                "Image resolution is too low. Use a clearer ballot scan."
-            );
-        }
-
-        // Camera photo may include background around the A5 paper.
-        // Validate the ballot geometry using its four markers instead.
-
-        let marks;
-        let H;
-
-        try {
-            marks = await findMarkers(
-                image,
-                info.width,
-                info.height
-            );
-            if (!Array.isArray(marks) || marks.length !== 4) {
-                throw new Error("Four registration markers are required.");
-            }
-
-            const markerPoints = [
-                { x: mm(9.5), y: mm(7.5) },
-                { x: mm(138.5), y: mm(7.5) },
-                { x: mm(9.5), y: mm(200.5) },
-                { x: mm(138.5), y: mm(200.5) }
-            ];
-
-            // Check marker geometry before reading any votes.
-            const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-            const top = distance(marks[0], marks[1]);
-            const bottom = distance(marks[2], marks[3]);
-            const left = distance(marks[0], marks[2]);
-            const right = distance(marks[1], marks[3]);
-            const measuredRatio = ((top + bottom) / 2) / ((left + right) / 2);
-            const expectedRatio =
-                (markerPoints[1].x - markerPoints[0].x) /
-                (markerPoints[2].y - markerPoints[0].y);
-
-            if (
-                !Number.isFinite(measuredRatio) ||
-                Math.abs(measuredRatio - expectedRatio) > 0.22 ||
-                Math.abs(top - bottom) / Math.max(top, bottom) > 0.35 ||
-                Math.abs(left - right) / Math.max(left, right) > 0.35
-            ) {
-                throw new Error(
-                    "Registration markers do not match one A5 portrait ballot."
-                );
-            }
-
-            H = homography(markerPoints, marks);
-
-        } catch (error) {
-            return fail(
-                422,
-                "Alignment failed. Retake the photo. " + error.message
-            );
-        }
+        // Identity homography: corrected image ay
+        // nasa template coordinate space na.
+        const identityH = [
+            1, 0, 0,
+            0, 1, 0,
+            0, 0
+        ];
 
         let analysis;
 
         try {
             analysis = analyzeBubbleCoordinates(
-                image,
-                H,
+                correctedBallot,
+                identityH,
                 record.coordinates,
                 paper
             );
         } catch (error) {
             return fail(
                 422,
-                "Bubble alignment failed. " + error.message
+                "Bubble detection failed. Retake the photo. " +
+                error.message,
+                {
+                    retake_required: true,
+                    quality_issue: "BUBBLE_ALIGNMENT"
+                }
             );
         }
 
         const { positions, votes } = analysis;
 
-        // Never finalize a ballot with unresolved bubble readings.
-        // This protects potentially valid votes from being lost.
+        // Any uncertain candidate triggers retake,
+        // including positions with overvotes.
         const needsReview = positions.filter(
-            position => position.result === "NEEDS_REVIEW"
+            position =>
+                position.result === "NEEDS_REVIEW" ||
+                position.unclear === true ||
+                position.candidates.some(
+                    candidate => candidate.unclear === true
+                )
         );
 
         if (counting && needsReview.length) {
             return fail(
                 422,
-                "Unclear shading detected. No votes saved. Retake or rescan the ballot.",
+                "Unclear shading detected. Retake or rescan " +
+                "the same ballot. No votes saved.",
                 {
-                    review_required: true,
-                    quality_issue: "UNCLEAR_SHADING",
                     retake_required: true,
-                    
+                    quality_issue: "UNCLEAR_SHADING",
+                    review_required: true,
                     positions,
                     unclear_positions: needsReview.map(
                         position => position.position_name
@@ -1266,39 +1921,7 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
-        if (counting && votes.length === 0) {
-            // Diagnostic-only information. No ballot is counted or marked used.
-            // Inspect this in a controlled test; remove detailed measurements
-            // from public production responses after the alignment is fixed.
-            return fail(
-                422,
-                "Blank ballot detected. No votes counted. " +
-                "This ballot can still be used.",
-                {
-                    diagnostic: {
-                        image: {
-                            width: info.width,
-                            height: info.height
-                        },
-                        registration_marks: marks.map(mark => ({
-                            x: Math.round(mark.x * 10) / 10,
-                            y: Math.round(mark.y * 10) / 10
-                        })),
-                        positions: positions.map(position => ({
-                            position: position.position_name,
-                            result: position.result,
-                            candidates: position.candidates.map(candidate => ({
-                                name: candidate.name,
-                                contrast: candidate.contrast,
-                                fill_intensity: candidate.fill_intensity,
-                                filled: candidate.filled,
-                                unclear: candidate.unclear
-                            }))
-                        }))
-                    }
-                }
-            );
-        }
+        // DATABASE TRANSACTION
 
         if (counting) {
             await db.beginTransaction();
@@ -1461,9 +2084,58 @@ exports.uploadAndProcess = async (req, res) => {
             position => position.result.startsWith("SKIPPED")
         ).length;
 
+        // Gumawa ng corrected A5 preview para sa scanner UI.
+        // Hindi dapat maapektuhan ang committed votes
+        // kapag pumalya ang preview encoding.
+        let correctedPreview = null;
+
+        try {
+            const previewWidth = Math.min(
+                900,
+                correctedBallot.width
+            );
+
+            const previewBuffer = await sharp(
+                correctedBallot.data,
+                {
+                    raw: {
+                        width: correctedBallot.width,
+                        height: correctedBallot.height,
+                        channels: 1
+                    }
+                }
+            )
+                .resize({
+                    width: previewWidth,
+                    withoutEnlargement: true
+                })
+                .jpeg({
+                    quality: 72,
+                    mozjpeg: true
+                })
+                .toBuffer();
+
+            // Limitahan ang payload para sa mobile.
+            if (previewBuffer.length <= 350 * 1024) {
+                correctedPreview = {
+                    mime_type: "image/jpeg",
+                    base64: previewBuffer.toString("base64"),
+                    width: previewWidth,
+                    height: Math.round(
+                        correctedBallot.height *
+                        previewWidth / correctedBallot.width
+                    )
+                };
+            }
+        } catch (previewError) {
+            console.error(
+                "OMR corrected preview unavailable:",
+                previewError.message
+            );
+        }
+
         return res.status(200).json({
             success: true,
-
             valid: true,
             preview_only: !counting,
             counted: counting,
@@ -1473,21 +2145,31 @@ exports.uploadAndProcess = async (req, res) => {
             ballot_id: qr.ballot_id,
             status: counting ? "COUNTED" : ballotStatus,
             paper_size: paperSize,
+
             source: {
                 width: info.width,
                 height: info.height
             },
+
             markers_detected: marks.length,
             sensitivity: "Balanced",
             selected_bubbles: selectedBubbles,
             overvotes,
             skipped_positions: skippedPositions,
             review_required: needsReview.length > 0,
+
             unclear_positions: needsReview.map(
                 position => position.position_name
             ),
+
             saved_votes: counting ? votes.length : 0,
+
+            // Ito ang babasahin ng scanner.js
+            // para ipakita ang aligned A5 ballot.
+            corrected_preview: correctedPreview,
+
             positions,
+
             message: counting
                 ? `Ballot counted. ${votes.length} votes saved.`
                 : `Preview complete. ${votes.length} valid votes detected. Nothing saved.`
@@ -1581,6 +2263,7 @@ exports.getLiveTallies = async (req, res) => {
             });
         }
 
+        // Kunin ang confirmed votes ng bawat candidate.
         const [rows] = await pool.execute(
             `SELECT
                 p.position_id,
@@ -1624,6 +2307,8 @@ exports.getLiveTallies = async (req, res) => {
             total_votes: Number(row.total_votes)
         }));
 
+        // Live tallies lang ang ibalik.
+        // Corrected preview ay nasa uploadAndProcess().
         return res.status(200).json({
             success: true,
             election_id: electionId,
