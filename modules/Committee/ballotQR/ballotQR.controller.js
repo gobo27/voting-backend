@@ -25,10 +25,11 @@ async function existingBatchResponse(
     requestId,
     electionId,
     templateId,
-    quantity
+    quantity,
+    batchType
 ) {
     const [batches] = await db.execute(
-        `SELECT batch_id, election_id, template_id, quantity
+        `SELECT batch_id, election_id, template_id, quantity, batch_type
          FROM ballot_print_batches
          WHERE request_id = ?
          LIMIT 1`,
@@ -42,7 +43,8 @@ async function existingBatchResponse(
     if (
         Number(batch.election_id) !== electionId ||
         Number(batch.template_id) !== templateId ||
-        Number(batch.quantity) !== quantity
+        Number(batch.quantity) !== quantity ||
+        batch.batch_type !== batchType
     ) {
         return { conflict: true };
     }
@@ -80,7 +82,8 @@ async function existingBatchResponse(
         batch_id: Number(batch.batch_id),
         quantity: ballots.length,
         ballots,
-        already_created: true
+        already_created: true,
+        batch_type: batchType
     };
 }
 
@@ -90,6 +93,7 @@ exports.createBatch = async (req, res) => {
     const templateId = Number(req.body?.template_id);
     const quantity = Number(req.body?.quantity);
     const requestId = String(req.body?.request_id || "");
+    const batchType = req.body?.batch_type ?? "ORIGINAL";
 
     const uuidPattern =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -100,11 +104,12 @@ exports.createBatch = async (req, res) => {
         !Number.isSafeInteger(quantity) ||
         quantity < 1 ||
         quantity > 500 ||
-        !uuidPattern.test(requestId)
+        !uuidPattern.test(requestId) ||
+        !["ORIGINAL", "ADDITIONAL"].includes(batchType)
     ) {
         return res.status(400).json({
             message:
-                "Valid election, template, quantity (1-500), and request_id required."
+                "Valid election, template, quantity (1-500), request_id, and batch_type required."
         });
     }
 
@@ -119,7 +124,8 @@ exports.createBatch = async (req, res) => {
             requestId,
             electionId,
             templateId,
-            quantity
+            quantity,
+            batchType
         );
 
         if (previous) {
@@ -158,13 +164,14 @@ exports.createBatch = async (req, res) => {
         try {
             [batchResult] = await db.execute(
                 `INSERT INTO ballot_print_batches
-                 (election_id, template_id, quantity, request_id)
-                 VALUES (?, ?, ?, ?)`,
+                 (election_id, template_id, quantity, request_id, batch_type)
+                 VALUES (?, ?, ?, ?, ?)`,
                 [
                     electionId,
                     templateId,
                     quantity,
-                    requestId
+                    requestId,
+                    batchType
                 ]
             );
         } catch (error) {
@@ -181,7 +188,8 @@ exports.createBatch = async (req, res) => {
                     requestId,
                     electionId,
                     templateId,
-                    quantity
+                    quantity,
+                    batchType
                 );
 
             if (!previousAfterRace) {
@@ -247,7 +255,8 @@ exports.createBatch = async (req, res) => {
             batch_id: batchId,
             quantity: result.length,
             ballots: result,
-            already_created: false
+            already_created: false,
+            batch_type: batchType
         });
 
     } catch (error) {
@@ -366,6 +375,7 @@ exports.listBatchesByElection = async (req, res) => {
                 t.template_name,
                 t.paper_size,
                 b.quantity,
+                b.batch_type,
                 b.created_at,
                 COUNT(i.ballot_id) AS registered_count
             FROM ballot_print_batches b
@@ -387,6 +397,7 @@ exports.listBatchesByElection = async (req, res) => {
                 t.template_name,
                 t.paper_size,
                 b.quantity,
+                b.batch_type,
                 b.created_at
             ORDER BY
                 b.created_at DESC,
@@ -409,6 +420,7 @@ exports.listBatchesByElection = async (req, res) => {
                 template_name: row.template_name,
                 paper_size: row.paper_size,
                 quantity: Number(row.quantity),
+                batch_type: row.batch_type,
                 registered_count: Number(
                     row.registered_count
                 ),
@@ -660,8 +672,22 @@ exports.getPrintSummary = async (req, res) => {
             [electionId]
         );
 
+        // Additional batches are confirmed as ORIGINAL physical prints,
+        // but counted separately using batch_type.
+        const [byType] = await pool.execute(
+            `SELECT
+                COALESCE(SUM(CASE WHEN b.batch_type = 'ORIGINAL' AND l.print_type = 'ORIGINAL' THEN l.quantity ELSE 0 END), 0) AS initial_printed,
+                COALESCE(SUM(CASE WHEN b.batch_type = 'ADDITIONAL' AND l.print_type = 'ORIGINAL' THEN l.quantity ELSE 0 END), 0) AS additional_printed
+             FROM ballot_print_logs l
+             INNER JOIN ballot_print_batches b ON b.batch_id = l.batch_id
+             WHERE l.election_id = ?`,
+            [electionId]
+        );
+
         return res.json({
             election_id: electionId,
+            initial_printed: Number(byType[0].initial_printed),
+            additional_printed: Number(byType[0].additional_printed),
 
             registered_unique: Number(
                 registered[0].count
