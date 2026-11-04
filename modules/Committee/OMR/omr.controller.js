@@ -493,45 +493,73 @@ async function grayscaleToQRImage(image) {
 
 // Subukan ang iba't ibang image sizes.
 
+
 async function scanQRAtMultipleSizes(imageBuffer) {
-    const sizes = [
-        null,
-        1600,
-        1000
+    const metadata = await sharp(imageBuffer).metadata();
+
+    const width = metadata.width;
+    const height = metadata.height;
+
+    if (!width || !height) {
+        return null;
+    }
+
+    // Mas maliit na full image, mas malaking QR crop.
+    const targetWidths = [
+        Math.min(width, 1400),
+        Math.min(width, 900)
     ];
 
-    for (const size of sizes) {
-        let pipeline = sharp(imageBuffer);
+    if (width <= 1000) {
+        targetWidths.push(Math.min(width * 2, 1800));
+    }
 
-        if (size !== null) {
-            pipeline = pipeline.resize({
-                width: size,
-                withoutEnlargement: true
-            });
-        }
+    const sizes = [...new Set(targetWidths)];
 
-        const result = await pipeline
-            .ensureAlpha()
-            .raw()
-            .toBuffer({
-                resolveWithObject: true
-            });
+    for (const targetWidth of sizes) {
+        for (const mode of ["original", "normalize", "threshold"]) {
+            let pipeline = sharp(imageBuffer)
+                .resize({
+                    width: targetWidth,
+                    kernel: "lanczos3"
+                })
+                .grayscale();
 
-        const decoded = decodeQRBuffer(
-            result.data,
-            result.info.width,
-            result.info.height
-        );
+            // Subukan ang contrast correction.
+            if (mode === "normalize") {
+                pipeline = pipeline.normalize();
+            }
 
-        if (decoded) {
-            return decoded;
+            // Subukan ang black-and-white QR.
+            if (mode === "threshold") {
+                pipeline = pipeline.normalize().threshold(145);
+            }
+
+            const result = await pipeline
+                .ensureAlpha()
+                .raw()
+                .toBuffer({
+                    resolveWithObject: true
+                });
+
+            const decoded = decodeQRBuffer(
+                result.data,
+                result.info.width,
+                result.info.height
+            );
+
+            if (decoded) {
+                return decoded;
+            }
         }
     }
 
     return null;
 }
 
+
 // Hanapin ang QR sa full image at upper-right.
+
 async function scanQRRegions(imageBuffer) {
     const metadata = await sharp(imageBuffer).metadata();
 
@@ -547,87 +575,89 @@ async function scanQRRegions(imageBuffer) {
         return null;
     }
 
-    // Unahin ang full image.
-    const fullResult = await scanQRAtMultipleSizes(
-        imageBuffer
-    );
-
-    if (fullResult) {
-        return fullResult;
-    }
-
-    // QR ng A5 ballot ay nasa upper-right region.
+    // Unahin ang upper-right dahil dito naka-print ang QR.
     const regions = [
-        {
-            left: Math.floor(width * 0.55),
-            top: 0,
-            width: width - Math.floor(width * 0.55),
-            height: Math.max(
-                1,
-                Math.floor(height * 0.45)
-            )
-        },
-        {
-            left: Math.floor(width * 0.65),
-            top: 0,
-            width: width - Math.floor(width * 0.65),
-            height: Math.max(
-                1,
-                Math.floor(height * 0.35)
-            )
-        }
+        { left: 0.55, top: 0.00, right: 1.00, bottom: 0.45 },
+        { left: 0.65, top: 0.00, right: 1.00, bottom: 0.35 },
+        { left: 0.50, top: 0.00, right: 1.00, bottom: 0.55 },
+        { left: 0.60, top: 0.03, right: 0.98, bottom: 0.30 }
     ];
 
     for (const region of regions) {
+        const left = Math.floor(width * region.left);
+        const top = Math.floor(height * region.top);
+        const right = Math.ceil(width * region.right);
+        const bottom = Math.ceil(height * region.bottom);
+
+        const cropWidth = right - left;
+        const cropHeight = bottom - top;
+
+        if (cropWidth < 100 || cropHeight < 100) {
+            continue;
+        }
+
         const cropped = await sharp(imageBuffer)
-            .extract(region)
+            .extract({
+                left,
+                top,
+                width: cropWidth,
+                height: cropHeight
+            })
             .png()
             .toBuffer();
 
-        const decoded = await scanQRAtMultipleSizes(
-            cropped
-        );
+        const decoded = await scanQRAtMultipleSizes(cropped);
 
         if (decoded) {
             return decoded;
         }
     }
 
-    return null;
+    // Full image fallback kung hindi nakita sa upper-right.
+    return await scanQRAtMultipleSizes(imageBuffer);
 }
 
+
 // Original photo muna, corrected image bilang fallback.
+
 async function readBallotQR(imagePath, correctedImage = null) {
-    // I-apply ang EXIF orientation ng phone photo.
+    // Ayusin ang orientation ng photo mula sa iPhone.
     const originalBuffer = await sharp(imagePath)
         .rotate()
         .png()
         .toBuffer();
 
+    // Unahin ang original photo.
     let result = await scanQRRegions(originalBuffer);
 
     if (result) {
         return result;
     }
 
-    // Gamitin ang corrected image kung available.
+    // Subukan ang perspective-corrected A5 ballot.
     if (correctedImage) {
-        const correctedBuffer =
-            await encodeCorrectedBallot(correctedImage);
+        const correctedBuffer = await sharp(
+            correctedImage.data,
+            {
+                raw: {
+                    width: correctedImage.width,
+                    height: correctedImage.height,
+                    channels: 1
+                }
+            }
+        )
+            .png()
+            .toBuffer();
 
-        result = await scanQRRegions(
-            correctedBuffer
-        );
+        result = await scanQRRegions(correctedBuffer);
 
         if (result) {
             return result;
         }
     }
 
-    // Fallback: lighting correction ng original photo.
-    const normalized = await normalizeOMRLighting(
-        imagePath
-    );
+    // Huling attempt: lighting-corrected original.
+    const normalized = await normalizeOMRLighting(imagePath);
 
     const normalizedBuffer = await sharp(
         normalized.data,
@@ -642,20 +672,19 @@ async function readBallotQR(imagePath, correctedImage = null) {
         .png()
         .toBuffer();
 
-    result = await scanQRRegions(
-        normalizedBuffer
-    );
+    result = await scanQRRegions(normalizedBuffer);
 
     if (result) {
         return result;
     }
 
-    // Hindi valid ang QR: hindi magbibilang.
+    // Walang valid QR, kaya bawal mag-count.
     throw new Error(
         "QR code not detected. Retake a clearer photo " +
         "with the entire A5 ballot visible. No votes recorded."
     );
 }
+
 
 // taga kuha ng template at original bubble coordinates.
 
