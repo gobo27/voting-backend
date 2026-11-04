@@ -19,33 +19,121 @@ function qrPayload(ballot) {
     ].join("|");
 }
 
-// =========================================
-// GENERATE REGISTERED QR BALLOT BATCH
-// POST /api/ballots/qr/batches
-// =========================================
+// Same request_id, same registered QR batch.
+async function existingBatchResponse(
+    db,
+    requestId,
+    electionId,
+    templateId,
+    quantity
+) {
+    const [batches] = await db.execute(
+        `SELECT batch_id, election_id, template_id, quantity
+         FROM ballot_print_batches
+         WHERE request_id = ?
+         LIMIT 1`,
+        [requestId]
+    );
 
+    if (!batches.length) return null;
+
+    const batch = batches[0];
+
+    if (
+        Number(batch.election_id) !== electionId ||
+        Number(batch.template_id) !== templateId ||
+        Number(batch.quantity) !== quantity
+    ) {
+        return { conflict: true };
+    }
+
+    const [rows] = await db.execute(
+        `SELECT ballot_id, election_id, template_id
+         FROM issued_ballots
+         WHERE batch_id = ?
+         ORDER BY created_at, ballot_id`,
+        [batch.batch_id]
+    );
+
+    if (rows.length !== quantity) {
+        throw new Error(
+            "Registered batch has an unexpected ballot count."
+        );
+    }
+
+    const ballots = await Promise.all(
+        rows.map(async ballot => ({
+            ballot_id: ballot.ballot_id,
+            qr_code: await QRCode.toDataURL(
+                qrPayload(ballot),
+                {
+                    errorCorrectionLevel: "H",
+                    margin: 2,
+                    width: 320
+                }
+            )
+        }))
+    );
+
+    return {
+        message: "Existing QR batch reused.",
+        batch_id: Number(batch.batch_id),
+        quantity: ballots.length,
+        ballots,
+        already_created: true
+    };
+}
+
+// Generate new batch; protect against duplicate requests.
 exports.createBatch = async (req, res) => {
-    const electionId = Number(req.body.election_id);
-    const templateId = Number(req.body.template_id);
-    const quantity = Number(req.body.quantity);
+    const electionId = Number(req.body?.election_id);
+    const templateId = Number(req.body?.template_id);
+    const quantity = Number(req.body?.quantity);
+    const requestId = String(req.body?.request_id || "");
+
+    const uuidPattern =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
     if (
         !validId(electionId) ||
         !validId(templateId) ||
         !Number.isSafeInteger(quantity) ||
         quantity < 1 ||
-        quantity > 500
+        quantity > 500 ||
+        !uuidPattern.test(requestId)
     ) {
         return res.status(400).json({
             message:
-                "Valid election, template and quantity (1-500) required."
+                "Valid election, template, quantity (1-500), and request_id required."
         });
     }
 
     let db;
+    let transactionOpen = false;
 
     try {
         db = await pool.getConnection();
+
+        const previous = await existingBatchResponse(
+            db,
+            requestId,
+            electionId,
+            templateId,
+            quantity
+        );
+
+        if (previous) {
+            return res.status(
+                previous.conflict ? 409 : 200
+            ).json(
+                previous.conflict
+                    ? {
+                        message:
+                            "Request ID was used with different batch details."
+                    }
+                    : previous
+            );
+        }
 
         const [templates] = await db.execute(
             `SELECT template_id
@@ -63,13 +151,54 @@ exports.createBatch = async (req, res) => {
         }
 
         await db.beginTransaction();
+        transactionOpen = true;
 
-        const [batchResult] = await db.execute(
-            `INSERT INTO ballot_print_batches
-             (election_id, template_id, quantity)
-             VALUES (?, ?, ?)`,
-            [electionId, templateId, quantity]
-        );
+        let batchResult;
+
+        try {
+            [batchResult] = await db.execute(
+                `INSERT INTO ballot_print_batches
+                 (election_id, template_id, quantity, request_id)
+                 VALUES (?, ?, ?, ?)`,
+                [
+                    electionId,
+                    templateId,
+                    quantity,
+                    requestId
+                ]
+            );
+        } catch (error) {
+            if (error.code !== "ER_DUP_ENTRY") {
+                throw error;
+            }
+
+            await db.rollback();
+            transactionOpen = false;
+
+            const previousAfterRace =
+                await existingBatchResponse(
+                    db,
+                    requestId,
+                    electionId,
+                    templateId,
+                    quantity
+                );
+
+            if (!previousAfterRace) {
+                throw error;
+            }
+
+            return res.status(
+                previousAfterRace.conflict ? 409 : 200
+            ).json(
+                previousAfterRace.conflict
+                    ? {
+                        message:
+                            "Request ID was used with different batch details."
+                    }
+                    : previousAfterRace
+            );
+        }
 
         const batchId = batchResult.insertId;
         const ballots = [];
@@ -97,34 +226,32 @@ exports.createBatch = async (req, res) => {
         }
 
         await db.commit();
+        transactionOpen = false;
 
-        const result = [];
-
-        for (const ballot of ballots) {
-            const qrCode = await QRCode.toDataURL(
-                qrPayload(ballot),
-                {
-                    errorCorrectionLevel: "H",
-                    margin: 2,
-                    width: 320
-                }
-            );
-
-            result.push({
+        const result = await Promise.all(
+            ballots.map(async ballot => ({
                 ballot_id: ballot.ballot_id,
-                qr_code: qrCode
-            });
-        }
+                qr_code: await QRCode.toDataURL(
+                    qrPayload(ballot),
+                    {
+                        errorCorrectionLevel: "H",
+                        margin: 2,
+                        width: 320
+                    }
+                )
+            }))
+        );
 
         return res.status(201).json({
             message: "Ballot batch generated.",
             batch_id: batchId,
             quantity: result.length,
-            ballots: result
+            ballots: result,
+            already_created: false
         });
 
     } catch (error) {
-        if (db) {
+        if (db && transactionOpen) {
             try {
                 await db.rollback();
             } catch (_) {}
@@ -141,11 +268,7 @@ exports.createBatch = async (req, res) => {
     }
 };
 
-// =========================================
-// GET EXISTING QR BATCH FOR REPRINT
-// GET /api/ballots/qr/batches/:batch_id
-// =========================================
-
+// Existing batch for reprint. No new IDs.
 exports.getBatch = async (req, res) => {
     const batchId = Number(req.params.batch_id);
 
@@ -202,11 +325,7 @@ exports.getBatch = async (req, res) => {
     }
 };
 
-// =========================================
-// LIST REGISTERED QR BATCHES
-// GET /api/ballots/qr/batches/election/:election_id
-// =========================================
-
+// List existing QR batches for an election.
 exports.listBatchesByElection = async (req, res) => {
     const electionId = Number(req.params.election_id);
     const templateIdRaw = req.query.template_id;
@@ -310,11 +429,7 @@ exports.listBatchesByElection = async (req, res) => {
     }
 };
 
-// =========================================
-// CONFIRM PHYSICAL PRINT QUANTITY
-// POST /api/ballots/qr/batches/:batch_id/confirm-print
-// =========================================
-
+// Confirm original print or reprint.
 exports.confirmPrint = async (req, res) => {
     const batchId = Number(req.params.batch_id);
 
@@ -345,7 +460,6 @@ exports.confirmPrint = async (req, res) => {
 
         await db.beginTransaction();
 
-        // Prevent duplicate records from repeated requests.
         const [existing] = await db.execute(
             `SELECT
                 event_id,
@@ -403,7 +517,6 @@ exports.confirmPrint = async (req, res) => {
 
         const batch = batches[0];
 
-        // Current system confirms a complete batch.
         if (quantity !== Number(batch.quantity)) {
             await db.rollback();
 
@@ -493,11 +606,7 @@ exports.confirmPrint = async (req, res) => {
     }
 };
 
-// =========================================
-// GET ORIGINAL / REPRINT / OVERALL TOTALS
-// GET /api/ballots/qr/print-summary/election/:election_id
-// =========================================
-
+// Registered, original, reprint and overall totals.
 exports.getPrintSummary = async (req, res) => {
     const electionId = Number(
         req.params.election_id
