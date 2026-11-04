@@ -105,7 +105,7 @@ async function normalizeOMRLighting(input) {
         !Number.isSafeInteger(original.width) ||
         !Number.isSafeInteger(original.height) ||
         original.data.length !==
-            original.width * original.height
+        original.width * original.height
     ) {
         throw new Error(
             "Invalid image supplied for lighting correction."
@@ -211,7 +211,7 @@ function sampleGrayBilinear(image, x, y) {
     );
 }
 
- // I-validate ang four registration markers.
+// I-validate ang four registration markers.
 function validateMarkerQuadrilateral(marks) {
     if (
         !Array.isArray(marks) ||
@@ -285,9 +285,9 @@ function validateMarkerQuadrilateral(marks) {
         !Number.isFinite(measuredRatio) ||
         Math.abs(measuredRatio - expectedRatio) > 0.22 ||
         Math.abs(top - bottom) /
-            Math.max(top, bottom) > 0.35 ||
+        Math.max(top, bottom) > 0.35 ||
         Math.abs(left - right) /
-            Math.max(left, right) > 0.35
+        Math.max(left, right) > 0.35
     ) {
         throw new Error(
             "Registration markers do not match " +
@@ -517,7 +517,7 @@ async function scanQRAtMultipleSizes(imageBuffer) {
     const sizes = [...new Set(targetWidths)];
 
     for (const targetWidth of sizes) {
-        for (const mode of ["original", "normalize", "threshold"]) {
+        for (const mode of ["original", "normalize"]) {
             let pipeline = sharp(imageBuffer)
                 .resize({
                     width: targetWidth,
@@ -765,14 +765,14 @@ async function findMarkers(
         !validId(normalizedImage.width) ||
         !validId(normalizedImage.height) ||
         normalizedImage.data.length !==
-            normalizedImage.width * normalizedImage.height
+        normalizedImage.width * normalizedImage.height
     ) {
         throw new Error("Invalid image for marker detection.");
     }
 
     const scale = Math.min(
         1,
-        1100 / Math.max(
+        1500 / Math.max(
             normalizedImage.width,
             normalizedImage.height
         )
@@ -798,7 +798,7 @@ async function findMarkers(
     const data = resized.data;
 
     // Subukan ang ilang thresholds para sa shadows.
-    const thresholds = [90, 115, 140];
+    const thresholds = [90, 125, 165];
     const candidates = [];
 
     for (const threshold of thresholds) {
@@ -876,14 +876,14 @@ async function findMarkers(
 
                 // Reject text, lines at malalaking shadows.
                 if (
-                    area < 12 ||
-                    bw < 4 ||
-                    bh < 4 ||
+                    area < 10 ||
+                    bw < 3 ||
+                    bh < 3 ||
                     bw > w * 0.065 ||
                     bh > h * 0.065 ||
-                    ratio < 0.65 ||
-                    ratio > 1.55 ||
-                    density < 0.70
+                    ratio < 0.60 ||
+                    ratio > 1.65 ||
+                    density < 0.60
                 ) {
                     continue;
                 }
