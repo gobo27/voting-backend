@@ -39,6 +39,81 @@ function median(values) {
         : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
+
+
+async function normalizeOMRLighting(imagePath) {
+    // Basahin ang original image bilang grayscale.
+    const original = await sharp(imagePath)
+        .rotate()
+        .grayscale()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+    const { width, height } = original.info;
+
+    const radius = Math.max(
+        3,
+        Math.min(
+            60,
+            Math.round(Math.min(width, height) / 35)
+        )
+    );
+
+    // Estimate ang local brightness ng papel.
+    const background = await sharp(
+        original.data,
+        {
+            raw: {
+                width,
+                height,
+                channels: 1
+            }
+        }
+    )
+        .blur(radius)
+        .raw()
+        .toBuffer();
+
+    const normalized = Buffer.allocUnsafe(width * height);
+
+    let darkPixels = 0;
+    let brightPixels = 0;
+
+    // Sukatin ang exposure sa original image.
+    for (let i = 0; i < original.data.length; i++) {
+        const value = original.data[i];
+
+        if (value <= 5) darkPixels++;
+        if (value >= 250) brightPixels++;
+    }
+
+    for (let i = 0; i < normalized.length; i++) {
+        const pixel = original.data[i];
+        const localLight = background[i];
+
+        // Moderate correction para hindi mawala ang light shades.
+        const corrected =
+            205 + (pixel - localLight) * 1.15;
+
+        normalized[i] = Math.max(
+            0,
+            Math.min(255, Math.round(corrected))
+        );
+    }
+
+    return {
+        data: normalized,
+        width,
+        height,
+        quality: {
+            dark_ratio: darkPixels / original.data.length,
+            bright_ratio: brightPixels / original.data.length
+        }
+    };
+}
+
+
+
 function parseQR(qrData) {
     const parts = String(qrData || "")
         .trim()
@@ -195,7 +270,7 @@ async function getTemplateCoordinates(
 // REGISTRATION MARKERS
 
 async function findMarkers(
-    imagePath,
+    normalizedImage,
     originalWidth,
     originalHeight
 ) {
@@ -217,22 +292,30 @@ async function findMarkers(
         Math.round(originalHeight * scale)
     );
 
-    const { data } = await sharp(imagePath)
-        .rotate()
+    const { data } = await sharp(
+        normalizedImage.data,
+        {
+            raw: {
+                width: normalizedImage.width,
+                height: normalizedImage.height,
+                channels: 1
+            }
+        }
+    )
         .resize(w, h, {
             fit: "fill"
         })
-        .grayscale()
         .raw()
         .toBuffer({
             resolveWithObject: true
         });
 
+
     const mask = new Uint8Array(w * h);
     const seen = new Uint8Array(w * h);
 
     for (let i = 0; i < mask.length; i++) {
-        mask[i] = data[i] < 95 ? 1 : 0;
+        mask[i] = data[i] < 115 ? 1 : 0;
     }
 
     const corners = [
@@ -563,6 +646,7 @@ function sample(image, H, x, y) {
 
 /* OMR BUBBLE DETECTION */
 
+
 function measure(image, H, coordinate, sensitivity, dimensions) {
     const x = Number(coordinate.x_pos);
     const y = Number(coordinate.y_pos);
@@ -587,17 +671,19 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
     const inside = [];
     const paper = [];
 
-    for (let j = -12; j <= 12; j++) {
-        for (let i = -12; i <= 12; i++) {
-            const r = Math.hypot(i / 12, j / 12);
+    // Sample only the inner bubble area.
+    // Iwasan ang printed outline ng bilog.
+    for (let j = -16; j <= 16; j++) {
+        for (let i = -16; i <= 16; i++) {
+            const r = Math.hypot(i / 16, j / 16);
 
-            if (r > 0.60) continue;
+            if (r > 0.65) continue;
 
             const value = sample(
                 image,
                 H,
-                cx + (i / 12) * w * 0.42,
-                cy + (j / 12) * h * 0.42
+                cx + (i / 16) * w * 0.42,
+                cy + (j / 16) * h * 0.42
             );
 
             if (value !== null) {
@@ -606,17 +692,18 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         }
     }
 
-    for (let j = -16; j <= 16; j++) {
-        for (let i = -16; i <= 16; i++) {
-            const r = Math.hypot(i / 16, j / 16);
+    // Sample nearby paper for local brightness.
+    for (let j = -20; j <= 20; j++) {
+        for (let i = -20; i <= 20; i++) {
+            const r = Math.hypot(i / 20, j / 20);
 
-            if (r < 0.75 || r > 1) continue;
+            if (r < 0.78 || r > 1) continue;
 
             const value = sample(
                 image,
                 H,
-                cx + (i / 16) * w * 0.95,
-                cy + (j / 16) * h * 0.95
+                cx + (i / 20) * w * 0.95,
+                cy + (j / 20) * h * 0.95
             );
 
             if (value !== null) {
@@ -625,9 +712,10 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         }
     }
 
-    if (inside.length < 50 || paper.length < 12) {
+    // Reject incomplete samples instead of guessing.
+    if (inside.length < 80 || paper.length < 20) {
         throw new Error(
-            "Insufficient bubble samples. Check image alignment."
+            "Insufficient bubble samples. Retake the photo."
         );
     }
 
@@ -648,21 +736,28 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         0
     ) / differences.length;
 
+    // Sensitivity settings are initial calibration values.
     const settings = {
         1: {
-            contrast: 32,
+            contrast: 30,
             minimum: 21,
-            requiredMarked: 0.32
+            requiredMarked: 0.32,
+            uncertainAverage: 10,
+            uncertainMarked: 0.12
         },
         2: {
-            contrast: 21,
+            contrast: 20,
             minimum: 13,
-            requiredMarked: 0.24
+            requiredMarked: 0.24,
+            uncertainAverage: 7,
+            uncertainMarked: 0.10
         },
         3: {
             contrast: 13,
             minimum: 8,
-            requiredMarked: 0.19
+            requiredMarked: 0.19,
+            uncertainAverage: 5,
+            uncertainMarked: 0.08
         }
     };
 
@@ -672,13 +767,42 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         value => value > setting.contrast
     ).length / differences.length;
 
+    const selected =
+        average >= setting.minimum &&
+        marked >= setting.requiredMarked;
+
+    // Borderline shading: huwag basta ituring na blank.
+    const possibleShade =
+        average >= setting.uncertainAverage &&
+        marked >= setting.uncertainMarked;
+
+    const unclear = !selected && possibleShade;
+
+    // Detect weak local contrast in the bubble area.
+    const sortedInside = [...inside].sort((a, b) => a - b);
+
+    const p10 = sortedInside[
+        Math.floor((sortedInside.length - 1) * 0.10)
+    ];
+
+    const p90 = sortedInside[
+        Math.floor((sortedInside.length - 1) * 0.90)
+    ];
+
+    const localContrast = p90 - p10;
+
     return {
-        selected:
-            average >= setting.minimum &&
-            marked >= setting.requiredMarked,
+        selected,
+        unclear,
         average,
         marked,
-        baseline
+        baseline,
+        localContrast,
+        confidence: selected
+            ? "SELECTED"
+            : unclear
+                ? "UNCERTAIN"
+                : "BLANK"
     };
 }
 
@@ -730,6 +854,7 @@ function validatePositionVotes(grouped) {
 
 /* CANDIDATE BUBBLE ANALYSIS */
 
+
 function analyzeBubbleCoordinates(image, H, coordinates, paper) {
     if (!Array.isArray(coordinates) || !coordinates.length) {
         throw new Error("No saved bubble coordinates found.");
@@ -756,6 +881,7 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
 
         seen.add(candidateId);
 
+        // Measure the bubble using local brightness.
         const measurement = measure(
             image,
             H,
@@ -781,26 +907,34 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
             );
         }
 
-        const unclear =
-            !measurement.selected &&
-            measurement.average >= 9 &&
-            measurement.average < 18 &&
-            measurement.marked >= 0.12;
+        // Uncertain shades trigger existing retake protection.
+        const unclear = measurement.unclear === true;
 
         position.candidates.push({
             candidate_id: candidateId,
             name: coord.candidate_name,
-            filled: measurement.selected,
+            filled: measurement.selected === true,
             unclear,
+
             fill_intensity:
                 Math.round(measurement.marked * 10000) / 100,
+
             contrast:
-                Math.round(measurement.average * 100) / 100
+                Math.round(measurement.average * 100) / 100,
+
+            confidence: measurement.confidence,
+
+            local_contrast:
+                Math.round(
+                    measurement.localContrast * 100
+                ) / 100
         });
     }
 
+    // Existing position validation remains unchanged.
     return validatePositionVotes(grouped);
 }
+
 
 /* QR VERIFICATION */
 
@@ -1006,17 +1140,29 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
-        const { data, info } = await sharp(req.file.path)
-            .rotate()
-            .grayscale()
-            .raw()
-            .toBuffer({ resolveWithObject: true });
+        const image = await normalizeOMRLighting(
+            req.file.path
+        );
 
-        const image = {
-            data,
-            width: info.width,
-            height: info.height
+        const info = {
+            width: image.width,
+            height: image.height
         };
+        if (
+            image.quality.dark_ratio > 0.50 ||
+            image.quality.bright_ratio > 0.80
+        ) {
+            return fail(
+                422,
+                "Poor image exposure. Retake the photo " +
+                "with more even lighting. No votes saved.",
+                {
+                    retake_required: true,
+                    quality_issue: "EXPOSURE"
+                }
+            );
+        }
+
 
         if (info.width < 500 || info.height < 700) {
             return fail(
@@ -1033,11 +1179,10 @@ exports.uploadAndProcess = async (req, res) => {
 
         try {
             marks = await findMarkers(
-                req.file.path,
+                image,
                 info.width,
                 info.height
             );
-
             if (!Array.isArray(marks) || marks.length !== 4) {
                 throw new Error("Four registration markers are required.");
             }
@@ -1110,7 +1255,9 @@ exports.uploadAndProcess = async (req, res) => {
                 "Unclear shading detected. No votes saved. Retake or rescan the ballot.",
                 {
                     review_required: true,
-
+                    quality_issue: "UNCLEAR_SHADING",
+                    retake_required: true,
+                    
                     positions,
                     unclear_positions: needsReview.map(
                         position => position.position_name
