@@ -66,69 +66,141 @@ function parseQR(qrData) {
     };
 }
 
-async function readBallotQR(imagePath) {
-    const { data, info } = await sharp(imagePath)
-        .rotate()
-        .ensureAlpha()
-        .raw()
-        .toBuffer({
-            resolveWithObject: true
-        });
 
-    let result = jsQR(
-        new Uint8ClampedArray(data),
-        info.width,
-        info.height,
-        {
-            inversionAttempts: "attemptBoth"
-        }
+async function readBallotQR(imagePath) {
+    const metadata = await sharp(imagePath)
+        .rotate()
+        .metadata();
+
+    const width = metadata.autoOrient
+        ? metadata.autoOrient.width
+        : metadata.width;
+
+    const height = metadata.autoOrient
+        ? metadata.autoOrient.height
+        : metadata.height;
+
+    if (!width || !height) {
+        throw new Error("Invalid ballot image dimensions.");
+    }
+
+    // Limitahan ang QR processing para hindi mabigat sa server.
+    const MAX_QR_SIDE = 1800;
+    const scale = Math.min(
+        1,
+        MAX_QR_SIDE / Math.max(width, height)
     );
 
-    if (!result) {
-        const cropX = Math.floor(
-            info.width * 0.65
-        );
+    const workWidth = Math.max(
+        1,
+        Math.round(width * scale)
+    );
 
-        const cropWidth =
-            info.width - cropX;
+    const workHeight = Math.max(
+        1,
+        Math.round(height * scale)
+    );
 
-        const cropHeight = Math.max(
-            1,
-            Math.floor(info.height * 0.40)
-        );
+    const base = await sharp(imagePath)
+        .rotate()
+        .resize(workWidth, workHeight, {
+            fit: "fill",
+            kernel: "lanczos3"
+        })
+        .png()
+        .toBuffer();
 
-        const crop = await sharp(imagePath)
-            .rotate()
-            .extract({
-                left: cropX,
-                top: 0,
-                width: cropWidth,
-                height: cropHeight
-            })
+    const regions = [
+        { name: "full", x: 0, y: 0, w: 1, h: 1 },
+        { name: "upper-right", x: 0.55, y: 0, w: 0.45, h: 0.45 },
+        { name: "upper-half", x: 0, y: 0, w: 1, h: 0.5 },
+        { name: "upper-left", x: 0, y: 0, w: 0.45, h: 0.45 }
+    ];
+
+    const decode = async (buffer, enhanced = false) => {
+        let pipeline = sharp(buffer);
+
+        if (enhanced) {
+            // Contrast correction para sa medyo madilim na QR.
+            pipeline = pipeline
+                .grayscale()
+                .normalise();
+        }
+
+        const { data, info } = await pipeline
             .ensureAlpha()
             .raw()
-            .toBuffer({
-                resolveWithObject: true
-            });
+            .toBuffer({ resolveWithObject: true });
 
-        result = jsQR(
-            new Uint8ClampedArray(crop.data),
-            crop.info.width,
-            crop.info.height,
+        const result = jsQR(
+            new Uint8ClampedArray(data),
+            info.width,
+            info.height,
             {
                 inversionAttempts: "attemptBoth"
             }
         );
-    }
 
-    if (!result) {
-        throw new Error(
-            "QR code not detected. No votes recorded."
+        return result?.data || null;
+    };
+
+    for (const region of regions) {
+        const left = Math.floor(region.x * workWidth);
+        const top = Math.floor(region.y * workHeight);
+
+        const cropWidth = Math.max(
+            1,
+            Math.min(
+                workWidth - left,
+                Math.round(region.w * workWidth)
+            )
         );
+
+        const cropHeight = Math.max(
+            1,
+            Math.min(
+                workHeight - top,
+                Math.round(region.h * workHeight)
+            )
+        );
+
+        const cropped = await sharp(base)
+            .extract({
+                left,
+                top,
+                width: cropWidth,
+                height: cropHeight
+            })
+            .png()
+            .toBuffer();
+
+        // Original pixels muna bago ang enhanced version.
+        for (const enhanced of [false, true]) {
+            const rawQR = await decode(cropped, enhanced);
+
+            if (rawQR) {
+                // Valid CampusVote QR format pa rin ang kailangan.
+                const qr = parseQR(rawQR);
+
+                if (process.env.OMR_DEBUG === "true") {
+                    console.info("OMR QR detected:", {
+                        region: region.name,
+                        enhanced,
+                        width: cropWidth,
+                        height: cropHeight
+                    });
+                }
+
+                return qr;
+            }
+        }
     }
 
-    return parseQR(result.data);
+    throw new Error(
+        "QR code not detected. No votes recorded."
+    );
 }
+
 
 async function getTemplateCoordinates(
     db,
@@ -693,7 +765,7 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
     }
 
     // Mas matatag na local brightness reference.
-    
+
     const baseline = median(paper);
 
     const differences = inside.map(value =>
@@ -872,20 +944,20 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
             contrast:
                 Math.round(measurement.average * 100) / 100
         });
-        
-// Diagnostic values para sa OMR calibration.
-if (process.env.OMR_DEBUG === "true") {
-    console.info("OMR BUBBLE:", {
-        candidate_id: candidateId,
-        candidate: coord.candidate_name,
-        position: coord.position_name,
-        selected: measurement.selected,
-        unclear: measurement.unclear,
-        average: Number(measurement.average.toFixed(2)),
-        marked: Number(measurement.marked.toFixed(4)),
-        baseline: Number(measurement.baseline.toFixed(2))
-    });
-}
+
+        // Diagnostic values para sa OMR calibration.
+        if (process.env.OMR_DEBUG === "true") {
+            console.info("OMR BUBBLE:", {
+                candidate_id: candidateId,
+                candidate: coord.candidate_name,
+                position: coord.position_name,
+                selected: measurement.selected,
+                unclear: measurement.unclear,
+                average: Number(measurement.average.toFixed(2)),
+                marked: Number(measurement.marked.toFixed(4)),
+                baseline: Number(measurement.baseline.toFixed(2))
+            });
+        }
 
     }
 
