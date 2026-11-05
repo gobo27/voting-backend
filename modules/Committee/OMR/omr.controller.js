@@ -562,29 +562,52 @@ function project(H, x, y) {
     };
 }
 
+
 function sample(image, H, x, y) {
     const point = project(H, x, y);
 
-    if (!point) {
-        return null;
-    }
-
-    const px = Math.round(point.x);
-    const py = Math.round(point.y);
-
     if (
-        px < 0 ||
-        py < 0 ||
-        px >= image.width ||
-        py >= image.height
+        !point ||
+        !Number.isFinite(point.x) ||
+        !Number.isFinite(point.y)
     ) {
         return null;
     }
 
-    return image.data[
-        py * image.width + px
-    ];
+    const px = point.x;
+    const py = point.y;
+
+    if (
+        px < 0 ||
+        py < 0 ||
+        px >= image.width - 1 ||
+        py >= image.height - 1
+    ) {
+        return null;
+    }
+
+    // Bilinear sampling para hindi basta mag-round sa dark outline.
+    const x0 = Math.floor(px);
+    const y0 = Math.floor(py);
+    const x1 = x0 + 1;
+    const y1 = y0 + 1;
+
+    const dx = px - x0;
+    const dy = py - y0;
+
+    const index = y0 * image.width + x0;
+
+    const p00 = image.data[index];
+    const p10 = image.data[index + 1];
+    const p01 = image.data[index + image.width];
+    const p11 = image.data[index + image.width + 1];
+
+    const top = p00 * (1 - dx) + p10 * dx;
+    const bottom = p01 * (1 - dx) + p11 * dx;
+
+    return top * (1 - dy) + bottom * dy;
 }
+
 
 /* OMR BUBBLE DETECTION */
 
@@ -670,13 +693,8 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
     }
 
     // Mas matatag na local brightness reference.
-    const sortedPaper = [...paper].sort((a, b) => a - b);
-
-    const brightPaper = sortedPaper.slice(
-        Math.floor(sortedPaper.length * 0.5)
-    );
-
-    const baseline = median(brightPaper);
+    
+    const baseline = median(paper);
 
     const differences = inside.map(value =>
         Math.max(0, baseline - value)
@@ -854,6 +872,21 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
             contrast:
                 Math.round(measurement.average * 100) / 100
         });
+        
+// Diagnostic values para sa OMR calibration.
+if (process.env.OMR_DEBUG === "true") {
+    console.info("OMR BUBBLE:", {
+        candidate_id: candidateId,
+        candidate: coord.candidate_name,
+        position: coord.position_name,
+        selected: measurement.selected,
+        unclear: measurement.unclear,
+        average: Number(measurement.average.toFixed(2)),
+        marked: Number(measurement.marked.toFixed(4)),
+        baseline: Number(measurement.baseline.toFixed(2))
+    });
+}
+
     }
 
     return validatePositionVotes(grouped);
