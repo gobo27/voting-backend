@@ -607,10 +607,10 @@ exports.confirmPrint = async (req, res) => {
 };
 
 // Registered, original, reprint and overall totals.
+
+
 exports.getPrintSummary = async (req, res) => {
-    const electionId = Number(
-        req.params.election_id
-    );
+    const electionId = Number(req.params.election_id);
 
     if (!validId(electionId)) {
         return res.status(400).json({
@@ -619,6 +619,7 @@ exports.getPrintSummary = async (req, res) => {
     }
 
     try {
+        // Bilang ng unique registered QR ballots
         const [registered] = await pool.execute(
             `SELECT COUNT(*) AS count
              FROM issued_ballots
@@ -626,88 +627,59 @@ exports.getPrintSummary = async (req, res) => {
             [electionId]
         );
 
+        // Hiwalay ang Original at Additional gamit ang batch_type
         const [printed] = await pool.execute(
             `SELECT
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN print_type = 'ORIGINAL'
-                            THEN quantity
-                            ELSE 0
-                        END
-                    ),
-                    0
-                ) AS original,
+                COALESCE(SUM(
+                    CASE
+                        WHEN b.batch_type = 'ORIGINAL'
+                         AND l.print_type = 'ORIGINAL'
+                        THEN l.quantity
+                        ELSE 0
+                    END
+                ), 0) AS original,
 
-                COALESCE(
-                    SUM(
-                        CASE
-                            WHEN print_type = 'REPRINT'
-                            THEN quantity
-                            ELSE 0
-                        END
-                    ),
-                    0
-                ) AS reprints,
+                COALESCE(SUM(
+                    CASE
+                        WHEN b.batch_type = 'ADDITIONAL'
+                         AND l.print_type = 'ORIGINAL'
+                        THEN l.quantity
+                        ELSE 0
+                    END
+                ), 0) AS additional
 
-                COALESCE(
-                    SUM(quantity),
-                    0
-                ) AS overall
-
-             FROM ballot_print_logs
-             WHERE election_id = ?`,
-            [electionId]
-        );
-
-        // Additional batches are confirmed as ORIGINAL physical prints,
-        // but counted separately using batch_type.
-        const [byType] = await pool.execute(
-            `SELECT
-                COALESCE(SUM(CASE WHEN b.batch_type = 'ORIGINAL' AND l.print_type = 'ORIGINAL' THEN l.quantity ELSE 0 END), 0) AS initial_printed,
-                COALESCE(SUM(CASE WHEN b.batch_type = 'ADDITIONAL' AND l.print_type = 'ORIGINAL' THEN l.quantity ELSE 0 END), 0) AS additional_printed
              FROM ballot_print_logs l
-             INNER JOIN ballot_print_batches b ON b.batch_id = l.batch_id
+             INNER JOIN ballot_print_batches b
+                 ON b.batch_id = l.batch_id
              WHERE l.election_id = ?`,
             [electionId]
         );
 
+        const original = Number(printed[0].original);
+        const additional = Number(printed[0].additional);
+
         return res.json({
             election_id: electionId,
-            initial_printed: Number(byType[0].initial_printed),
-            additional_printed: Number(byType[0].additional_printed),
 
-            registered_unique: Number(
-                registered[0].count
-            ),
+            initial_printed: original,
+            additional_printed: additional,
 
-            original: Number(
-                printed[0].original
-            ),
+            original,
+            additional,
+            reprints: 0,
+            overall: original + additional,
 
-            reprints: Number(
-                printed[0].reprints
-            ),
-
-            overall: Number(
-                printed[0].overall
-            ),
+            registered_unique: Number(registered[0].count),
 
             unit: "individual A5 ballots",
-
-            note:
-                "Counts are operator-confirmed, not printer-verified. Earlier print jobs are not backfilled."
+            note: "Counts are operator-confirmed, not printer-verified."
         });
 
     } catch (error) {
-        console.error(
-            "Print summary error:",
-            error
-        );
+        console.error("Print summary error:", error);
 
         return res.status(500).json({
-            message:
-                "Failed to load print summary."
+            message: "Failed to load print summary."
         });
     }
 };
