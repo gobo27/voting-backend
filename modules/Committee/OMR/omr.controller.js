@@ -194,102 +194,68 @@ async function getTemplateCoordinates(
 
 // REGISTRATION MARKERS
 
-async function findMarkers(
-    imagePath,
-    originalWidth,
-    originalHeight
-) {
-    const scale = Math.min(
-        1,
-        1100 / Math.max(
-            originalWidth,
-            originalHeight
-        )
-    );
-
-    const w = Math.max(
-        1,
-        Math.round(originalWidth * scale)
-    );
-
-    const h = Math.max(
-        1,
-        Math.round(originalHeight * scale)
-    );
+async function findMarkers(imagePath, originalWidth, originalHeight) {
+    // Hanapin ang solid squares; huwag basta piliin ang QR pixels.
+    const scale = Math.min(1, 1100 / Math.max(originalWidth, originalHeight));
+    const w = Math.max(1, Math.round(originalWidth * scale));
+    const h = Math.max(1, Math.round(originalHeight * scale));
 
     const { data } = await sharp(imagePath)
         .rotate()
-        .resize(w, h, {
-            fit: "fill"
-        })
+        .resize(w, h, { fit: "fill" })
         .grayscale()
         .raw()
-        .toBuffer({
-            resolveWithObject: true
-        });
+        .toBuffer({ resolveWithObject: true });
 
     const mask = new Uint8Array(w * h);
     const seen = new Uint8Array(w * h);
 
     for (let i = 0; i < mask.length; i++) {
-        mask[i] = data[i] < 95 ? 1 : 0;
+        mask[i] = data[i] < 115 ? 1 : 0;
     }
 
     const corners = [
-        [0, 0],
-        [w - 1, 0],
-        [0, h - 1],
-        [w - 1, h - 1]
+        { x: 0, y: 0 },
+        { x: w - 1, y: 0 },
+        { x: 0, y: h - 1 },
+        { x: w - 1, y: h - 1 }
     ];
 
-    const found = [];
+    const candidates = [];
+    const maxX = Math.max(1, Math.round(w * 0.40));
+    const maxY = Math.max(1, Math.round(h * 0.40));
 
-    for (const [cx, cy] of corners) {
-        const x0 = cx === 0
-            ? 0
-            : Math.floor(w * 0.66);
+    for (let cornerIndex = 0; cornerIndex < 4; cornerIndex++) {
+        const corner = corners[cornerIndex];
 
-        const x1 = cx === 0
-            ? Math.ceil(w * 0.34)
-            : w;
+        const x0 = cornerIndex % 2 === 0 ? 0 : w - maxX;
+        const x1 = cornerIndex % 2 === 0 ? maxX : w;
+        const y0 = cornerIndex < 2 ? 0 : h - maxY;
+        const y1 = cornerIndex < 2 ? maxY : h;
 
-        const y0 = cy === 0
-            ? 0
-            : Math.floor(h * 0.66);
-
-        const y1 = cy === 0
-            ? Math.ceil(h * 0.34)
-            : h;
-
-        let best = null;
+        const list = [];
 
         for (let yy = y0; yy < y1; yy++) {
             for (let xx = x0; xx < x1; xx++) {
                 const start = yy * w + xx;
 
-                if (
-                    !mask[start] ||
-                    seen[start]
-                ) {
-                    continue;
-                }
+                if (!mask[start] || seen[start]) continue;
 
                 const stack = [start];
                 seen[start] = 1;
 
                 let area = 0;
-
-                let minX = xx;
-                let maxX = xx;
-                let minY = yy;
-                let maxY = yy;
-
                 let sx = 0;
                 let sy = 0;
 
+                let left = xx;
+                let right = xx;
+                let top = yy;
+                let bottom = yy;
+                let touchesBoundary = false;
+
                 while (stack.length) {
                     const n = stack.pop();
-
                     const px = n % w;
                     const py = Math.floor(n / w);
 
@@ -297,149 +263,208 @@ async function findMarkers(
                     sx += px;
                     sy += py;
 
-                    minX = Math.min(minX, px);
-                    maxX = Math.max(maxX, px);
-                    minY = Math.min(minY, py);
-                    maxY = Math.max(maxY, py);
+                    left = Math.min(left, px);
+                    right = Math.max(right, px);
+                    top = Math.min(top, py);
+                    bottom = Math.max(bottom, py);
 
-                    if (px > x0) {
-                        const q = n - 1;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
-                            seen[q] = 1;
-                            stack.push(q);
-                        }
+                    if (
+                        px === x0 ||
+                        px === x1 - 1 ||
+                        py === y0 ||
+                        py === y1 - 1
+                    ) {
+                        touchesBoundary = true;
                     }
 
-                    if (px + 1 < x1) {
-                        const q = n + 1;
+                    const neighbors = [
+                        px > x0 ? n - 1 : -1,
+                        px + 1 < x1 ? n + 1 : -1,
+                        py > y0 ? n - w : -1,
+                        py + 1 < y1 ? n + w : -1
+                    ];
 
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
-                            seen[q] = 1;
-                            stack.push(q);
-                        }
-                    }
-
-                    if (py > y0) {
-                        const q = n - w;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
-                            seen[q] = 1;
-                            stack.push(q);
-                        }
-                    }
-
-                    if (py + 1 < y1) {
-                        const q = n + w;
-
-                        if (
-                            mask[q] &&
-                            !seen[q]
-                        ) {
+                    for (const q of neighbors) {
+                        if (q >= 0 && mask[q] && !seen[q]) {
                             seen[q] = 1;
                             stack.push(q);
                         }
                     }
                 }
 
-                const bw = maxX - minX + 1;
-                const bh = maxY - minY + 1;
-
+                const bw = right - left + 1;
+                const bh = bottom - top + 1;
                 const ratio = bw / bh;
                 const density = area / (bw * bh);
+                const side = (bw + bh) / 2;
 
                 if (
-                    area < 8 ||
-                    bw < 3 ||
-                    bh < 3 ||
-                    bw > w * 0.08 ||
-                    bh > h * 0.08 ||
-                    ratio < 0.6 ||
-                    ratio > 1.65 ||
-                    density < 0.72
+                    touchesBoundary ||
+                    area < 12 ||
+                    side < 4 ||
+                    side > Math.min(w, h) * 0.055 ||
+                    ratio < 0.72 ||
+                    ratio > 1.38 ||
+                    density < 0.78
                 ) {
                     continue;
                 }
 
-                const mx = sx / area;
-                const my = sy / area;
-
+                const x = sx / area;
+                const y = sy / area;
                 const distance = Math.hypot(
-                    mx - cx,
-                    my - cy
+                    x - corner.x,
+                    y - corner.y
                 );
 
-                const score = area / (
-                    1 + distance
-                );
-
-                if (
-                    !best ||
-                    score > best.score
-                ) {
-                    best = {
-                        x: mx / scale,
-                        y: my / scale,
-                        score
-                    };
-                }
+                list.push({
+                    x,
+                    y,
+                    side,
+                    density,
+                    distance
+                });
             }
         }
 
-        if (!best) {
-            throw new Error(
-                "Four registration squares not detected. " +
-                "Keep all four corners visible."
-            );
-        }
-
-        found.push(best);
+        // Limitahan ang combinations para mabilis ang detection.
+        list.sort((a, b) => a.distance - b.distance);
+        candidates.push(list.slice(0, 16));
     }
 
-    const [tl, tr, bl, br] = found;
-
-    const topWidth = Math.hypot(
-        tr.x - tl.x,
-        tr.y - tl.y
-    );
-
-    const bottomWidth = Math.hypot(
-        br.x - bl.x,
-        br.y - bl.y
-    );
-
-    const leftHeight = Math.hypot(
-        bl.x - tl.x,
-        bl.y - tl.y
-    );
-
-    const rightHeight = Math.hypot(
-        br.x - tr.x,
-        br.y - tr.y
-    );
-
-    if (
-        topWidth < originalWidth * 0.45 ||
-        bottomWidth < originalWidth * 0.45 ||
-        leftHeight < originalHeight * 0.45 ||
-        rightHeight < originalHeight * 0.45
-    ) {
+    if (candidates.some(list => !list.length)) {
         throw new Error(
-            "Registration markers are too close together."
+            "Four registration squares not detected. " +
+            "Keep all four corners visible."
         );
     }
 
-    return [tl, tr, bl, br];
+    // I-compare ang geometry at laki ng apat na markers.
+    const expectedRatio = 129 / 193;
+    let best = null;
+
+    for (const tl of candidates[0]) {
+        for (const tr of candidates[1]) {
+            const top = Math.hypot(
+                tr.x - tl.x,
+                tr.y - tl.y
+            );
+
+            if (top < w * 0.40) continue;
+
+            for (const bl of candidates[2]) {
+                const left = Math.hypot(
+                    bl.x - tl.x,
+                    bl.y - tl.y
+                );
+
+                if (left < h * 0.40) continue;
+
+                for (const br of candidates[3]) {
+                    const bottom = Math.hypot(
+                        br.x - bl.x,
+                        br.y - bl.y
+                    );
+
+                    const right = Math.hypot(
+                        br.x - tr.x,
+                        br.y - tr.y
+                    );
+
+                    if (
+                        bottom < w * 0.40 ||
+                        right < h * 0.40
+                    ) {
+                        continue;
+                    }
+
+                    const measuredRatio =
+                        ((top + bottom) / 2) /
+                        ((left + right) / 2);
+
+                    const ratioError = Math.abs(
+                        measuredRatio - expectedRatio
+                    );
+
+                    const widthError =
+                        Math.abs(top - bottom) /
+                        Math.max(top, bottom);
+
+                    const heightError =
+                        Math.abs(left - right) /
+                        Math.max(left, right);
+
+                    const sizes = [
+                        tl.side,
+                        tr.side,
+                        bl.side,
+                        br.side
+                    ];
+
+                    const sizeError =
+                        (Math.max(...sizes) - Math.min(...sizes)) /
+                        Math.max(...sizes);
+
+                    const cross =
+                        (tr.x - tl.x) * (bl.y - tl.y) -
+                        (tr.y - tl.y) * (bl.x - tl.x);
+
+                    if (
+                        cross <= 0 ||
+                        ratioError > 0.22 ||
+                        widthError > 0.35 ||
+                        heightError > 0.35 ||
+                        sizeError > 0.48
+                    ) {
+                        continue;
+                    }
+
+                    const score =
+                        ratioError * 5 +
+                        widthError * 2 +
+                        heightError * 2 +
+                        sizeError * 1.5 +
+                        (
+                            tl.distance +
+                            tr.distance +
+                            bl.distance +
+                            br.distance
+                        ) / (w + h);
+
+                    if (!best || score < best.score) {
+                        best = {
+                            score,
+                            marks: [tl, tr, bl, br]
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    if (!best) {
+        throw new Error(
+            "Registration markers do not match one A5 portrait ballot."
+        );
+    }
+
+    const marks = best.marks.map(mark => ({
+        x: mark.x / scale,
+        y: mark.y / scale
+    }));
+
+    // Ipakita ang detected coordinates sa Render logs.
+    console.info(
+        "OMR registration markers:",
+        marks.map(mark => ({
+            x: Math.round(mark.x),
+            y: Math.round(mark.y)
+        }))
+    );
+
+    return marks;
 }
+
 
 /* HOMOGRAPHY AND COORDINATE ALIGNMENT */
 
