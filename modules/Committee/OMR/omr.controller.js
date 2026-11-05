@@ -515,6 +515,25 @@ async function findMarkers(imagePath, originalWidth, originalHeight) {
     }
 
     if (!best) {
+        // Tingnan kung anong squares ang nakita sa bawat corner.
+        console.warn("OMR ALIGNMENT DEBUG:", {
+            imageWidth: originalWidth,
+            imageHeight: originalHeight,
+            resizedWidth: w,
+            resizedHeight: h,
+            expectedRatio,
+            cornerCandidates: candidates.map((list, index) => ({
+                corner: ["TL", "TR", "BL", "BR"][index],
+                count: list.length,
+                nearest: list.slice(0, 5).map(mark => ({
+                    x: Math.round(mark.x / scale),
+                    y: Math.round(mark.y / scale),
+                    side: Number((mark.side / scale).toFixed(2)),
+                    density: Number(mark.density.toFixed(2))
+                }))
+            }))
+        });
+
         throw new Error(
             "Registration markers do not match one A5 portrait ballot."
         );
@@ -960,7 +979,7 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
 }
 
 return validatePositionVotes(grouped);
-}
+
 
 /* QR VERIFICATION */
 
