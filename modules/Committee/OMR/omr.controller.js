@@ -975,10 +975,10 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
             baseline: measurement.baseline
         });
     }
-
+    return validatePositionVotes(grouped);
 }
 
-return validatePositionVotes(grouped);
+
 
 
 /* QR VERIFICATION */
