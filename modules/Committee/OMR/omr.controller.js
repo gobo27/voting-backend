@@ -611,37 +611,46 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
 
     const inside = [];
     const paper = [];
+    let missingInside = 0;
 
-    for (let j = -12; j <= 12; j++) {
-        for (let i = -12; i <= 12; i++) {
-            const r = Math.hypot(i / 12, j / 12);
+    // Gitnang bahagi lang ng bubble ang susukatin.
+    for (let j = -16; j <= 16; j++) {
+        for (let i = -16; i <= 16; i++) {
+            const nx = i / 16;
+            const ny = j / 16;
+            const r = Math.hypot(nx, ny);
 
-            if (r > 0.60) continue;
+            if (r > 0.48) continue;
 
             const value = sample(
                 image,
                 H,
-                cx + (i / 12) * w * 0.42,
-                cy + (j / 12) * h * 0.42
+                cx + nx * w * 0.5,
+                cy + ny * h * 0.5
             );
 
-            if (value !== null) {
+            if (value === null) {
+                missingInside++;
+            } else {
                 inside.push(value);
             }
         }
     }
 
-    for (let j = -16; j <= 16; j++) {
-        for (let i = -16; i <= 16; i++) {
-            const r = Math.hypot(i / 16, j / 16);
+    // Local paper reference para sa lighting correction.
+    for (let j = -20; j <= 20; j++) {
+        for (let i = -20; i <= 20; i++) {
+            const nx = i / 20;
+            const ny = j / 20;
+            const r = Math.hypot(nx, ny);
 
-            if (r < 0.75 || r > 1) continue;
+            if (r < 0.78 || r > 0.98) continue;
 
             const value = sample(
                 image,
                 H,
-                cx + (i / 16) * w * 0.95,
-                cy + (j / 16) * h * 0.95
+                cx + nx * w * 0.95,
+                cy + ny * h * 0.95
             );
 
             if (value !== null) {
@@ -650,12 +659,17 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         }
     }
 
-    if (inside.length < 50 || paper.length < 12) {
+    if (
+        inside.length < 100 ||
+        paper.length < 30 ||
+        missingInside > 0
+    ) {
         throw new Error(
             "Insufficient bubble samples. Check image alignment."
         );
     }
 
+    // Mas matatag na local brightness reference.
     const sortedPaper = [...paper].sort((a, b) => a - b);
 
     const brightPaper = sortedPaper.slice(
@@ -673,39 +687,61 @@ function measure(image, H, coordinate, sensitivity, dimensions) {
         0
     ) / differences.length;
 
+    // Dark coverage ng mismong loob ng circle.
+    const marked = differences.filter(
+        value => value >= 35
+    ).length / differences.length;
+
+    // Conservative initial thresholds.
+    // Kailangan pa itong i-calibrate gamit ang test ballots.
     const settings = {
         1: {
-            contrast: 32,
-            minimum: 21,
-            requiredMarked: 0.32
+            minimum: 42,
+            requiredMarked: 0.65
         },
         2: {
-            contrast: 21,
-            minimum: 13,
-            requiredMarked: 0.24
+            minimum: 34,
+            requiredMarked: 0.58
         },
         3: {
-            contrast: 13,
-            minimum: 8,
-            requiredMarked: 0.19
+            minimum: 27,
+            requiredMarked: 0.52
         }
     };
 
     const setting = settings[sensitivity] || settings[2];
 
-    const marked = differences.filter(
-        value => value > setting.contrast
-    ).length / differences.length;
+    const selected =
+        average >= setting.minimum &&
+        marked >= setting.requiredMarked;
+
+    // Hindi tiyak ang reading: retake, huwag i-count.
+    const unclear =
+        !selected &&
+        (
+            (
+                average >= 14 &&
+                marked >= 0.20
+            ) ||
+            (
+                average >= setting.minimum &&
+                marked >= 0.35
+            ) ||
+            (
+                marked >= setting.requiredMarked &&
+                average >= 12
+            )
+        );
 
     return {
-        selected:
-            average >= setting.minimum &&
-            marked >= setting.requiredMarked,
+        selected,
+        unclear,
         average,
         marked,
         baseline
     };
 }
+
 
 /* POSITION VOTE VALIDATION */
 
@@ -806,11 +842,7 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
             );
         }
 
-        const unclear =
-            !measurement.selected &&
-            measurement.average >= 9 &&
-            measurement.average < 18 &&
-            measurement.marked >= 0.12;
+        const unclear = measurement.unclear === true;
 
         position.candidates.push({
             candidate_id: candidateId,
