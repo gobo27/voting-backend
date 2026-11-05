@@ -946,22 +946,20 @@ function analyzeBubbleCoordinates(image, H, coordinates, paper) {
         });
 
         // Diagnostic values para sa OMR calibration.
-        if (process.env.OMR_DEBUG === "true") {
-            console.info("OMR BUBBLE:", {
-                candidate_id: candidateId,
-                candidate: coord.candidate_name,
-                position: coord.position_name,
-                selected: measurement.selected,
-                unclear: measurement.unclear,
-                average: Number(measurement.average.toFixed(2)),
-                marked: Number(measurement.marked.toFixed(4)),
-                baseline: Number(measurement.baseline.toFixed(2))
-            });
-        }
-
+        console.info("OMR BUBBLE TEST:", {
+            candidate: coord.candidate_name,
+            position: coord.position_name,
+            selected: measurement.selected,
+            unclear: measurement.unclear,
+            average: measurement.average,
+            marked: measurement.marked,
+            baseline: measurement.baseline
+        });
     }
 
-    return validatePositionVotes(grouped);
+}
+
+return validatePositionVotes(grouped);
 }
 
 /* QR VERIFICATION */
