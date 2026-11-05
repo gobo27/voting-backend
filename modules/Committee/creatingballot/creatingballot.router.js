@@ -18,9 +18,7 @@ router.use(
     )
 );
 
-// ==========================================
 // BALLOT TEMPLATE ENDPOINTS
-// ==========================================
 
 // Create ballot template
 router.post(
@@ -58,9 +56,7 @@ router.delete(
     ballotController.deleteTemplate
 );
 
-// ==========================================
 // QR BALLOT PRINTING ENDPOINTS
-// ==========================================
 
 // Generate new unique QR batch
 router.post(
@@ -74,7 +70,7 @@ router.get(
     qrController.listBatchesByElection
 );
 
-// Reprint existing QR batch
+// Retrieve existing QR batch for recovery or verification
 router.get(
     "/qr/batches/:batch_id",
     qrController.getBatch

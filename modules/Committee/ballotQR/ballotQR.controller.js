@@ -455,7 +455,7 @@ exports.confirmPrint = async (req, res) => {
     if (
         !validId(batchId) ||
         !validEventId.test(String(event_id || "")) ||
-        !["ORIGINAL", "REPRINT"].includes(print_type) ||
+        print_type !== "ORIGINAL"||
         !Number.isSafeInteger(quantity) ||
         quantity < 1 ||
         quantity > 500
@@ -556,18 +556,6 @@ exports.confirmPrint = async (req, res) => {
             return res.status(409).json({
                 message:
                     "Original print already confirmed. Use REPRINT."
-            });
-        }
-
-        if (
-            print_type === "REPRINT" &&
-            !originals.length
-        ) {
-            await db.rollback();
-
-            return res.status(409).json({
-                message:
-                    "Confirm the original printing first."
             });
         }
 
