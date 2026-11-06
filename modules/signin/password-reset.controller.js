@@ -9,7 +9,6 @@ const {
     sendPasswordResetOtpEmail
 } = require("../super admin/adduser/emailjs.server");
 
-const TEST_EMAIL = "vmaldea27@gmail.com";
 const OTP_MINUTES = 10;
 const MAX_ATTEMPTS = 5;
 const COOLDOWN_SECONDS = 60;
@@ -36,10 +35,6 @@ function normalizeEmail(value) {
     return String(value || "").trim().toLowerCase();
 }
 
-function isTestAccount(email) {
-    return email === TEST_EMAIL;
-}
-
 function validPassword(password) {
     return typeof password === "string" &&
         password.length >= 12 &&
@@ -52,20 +47,13 @@ function validResetToken(token) {
         /^[a-f0-9]{64}$/.test(token);
 }
 
-// Request OTP
+// Request OTP para sa registered users
 exports.requestReset = async (req, res) => {
     const email = normalizeEmail(req.body?.email);
 
     if (!validEmail(email)) {
         return res.status(400).json({
             message: "Enter a valid email address."
-        });
-    }
-
-    //  to testing
-    if (!isTestAccount(email)) {
-        return res.json({
-            message: genericMessage
         });
     }
 
@@ -93,7 +81,6 @@ exports.requestReset = async (req, res) => {
 
         conn = await db.getConnection();
         await conn.beginTransaction();
-
 
         await conn.execute(
             `INSERT IGNORE INTO password_reset_otps
@@ -131,7 +118,7 @@ exports.requestReset = async (req, res) => {
             });
         }
 
-        // Limit the OTP request
+        // Limit ang sunod-sunod na OTP requests
         if (
             records[0].seconds_since !== null &&
             Number(records[0].seconds_since) < COOLDOWN_SECONDS
@@ -174,7 +161,7 @@ exports.requestReset = async (req, res) => {
         conn.release();
         conn = null;
 
-        // send ang OTP gamit ang EmailJS
+        // Send OTP gamit ang EmailJS
         try {
             const result = await sendPasswordResetOtpEmail({
                 to: user.email,
@@ -239,13 +226,13 @@ exports.requestReset = async (req, res) => {
     }
 };
 
-// to Verify 6-digit OTP
+// Verify ang 6-digit OTP
 exports.verifyReset = async (req, res) => {
     const email = normalizeEmail(req.body?.email);
     const otp = String(req.body?.otp || "").trim();
 
     if (
-        !isTestAccount(email) ||
+        !validEmail(email) ||
         !/^\d{6}$/.test(otp)
     ) {
         return res.status(400).json({
@@ -289,7 +276,7 @@ exports.verifyReset = async (req, res) => {
             });
         }
 
-        // to compare ang OTP sa stored bcrypt hash
+        // Compare ang OTP sa stored bcrypt hash
         const matches = record.otp_hash
             ? await bcrypt.compare(
                 otp,
@@ -364,14 +351,14 @@ exports.verifyReset = async (req, res) => {
     }
 };
 
-// Confirm at i-save new password
+// Confirm at i-save ang bagong password
 exports.confirmReset = async (req, res) => {
     const email = normalizeEmail(req.body?.email);
     const password = req.body?.password;
     const resetToken = req.body?.resetToken;
 
     if (
-        !isTestAccount(email) ||
+        !validEmail(email) ||
         !validPassword(password) ||
         !validResetToken(resetToken)
     ) {
@@ -407,7 +394,7 @@ exports.confirmReset = async (req, res) => {
         const storedHash =
             record?.verified_token_hash;
 
-        // Secure comparison to reset token
+        // Secure comparison ng reset token
         const authorized =
             record &&
             typeof storedHash === "string" &&
