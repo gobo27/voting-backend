@@ -275,7 +275,6 @@ exports.updateAccount = async (req, res) => {
     }
 };
 
-// DELETE ACCOUNT
 
  // DELETE ACCOUNT
 exports.deleteAccount = async (req, res) => {
