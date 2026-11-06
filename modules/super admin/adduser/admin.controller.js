@@ -2,7 +2,7 @@
 
 const bcrypt = require("bcryptjs");
 const db = require("../../../config/db");
-const { sendCredentialsEmail } = require("./resend.server");
+const { sendCredentialsEmail } = require("./emailjs.server");
 
 const ALLOWED_ROLES = ["adviser", "committee", "super_admin"];
 
@@ -98,12 +98,12 @@ exports.createAccount = async (req, res) => {
             }
         } catch (error) {
             emailError = error.message;
-            console.error("RESEND ERROR:", error);
+            console.error("EMAILJS ERROR:", error);
         }
 
         return res.status(201).json({
             message: emailSent
-                ? "Account created. Email accepted by Resend."
+                ? "Account created. Email accepted by EmailJS."
                 : "Account created, but email sending failed.",
             emailSent,
             emailRedirected,
