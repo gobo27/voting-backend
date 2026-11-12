@@ -546,8 +546,8 @@ function orientPreparedBallot(prepared, location) {
     for (const [key, point] of Object.entries(location)) {
         qrLocation[key] =
             point &&
-            Number.isFinite(point.x) &&
-            Number.isFinite(point.y)
+                Number.isFinite(point.x) &&
+                Number.isFinite(point.y)
                 ? rotatePoint(
                     point,
                     oldWidth,
@@ -2644,11 +2644,11 @@ exports.uploadAndProcess = async (req, res) => {
                     measuredRatio - expectedRatio
                 ) > ALIGNMENT_LIMITS.ratioError ||
                 Math.abs(top - bottom) /
-                    Math.max(top, bottom) >
-                    ALIGNMENT_LIMITS.widthError ||
+                Math.max(top, bottom) >
+                ALIGNMENT_LIMITS.widthError ||
                 Math.abs(left - right) /
-                    Math.max(left, right) >
-                    ALIGNMENT_LIMITS.heightError
+                Math.max(left, right) >
+                ALIGNMENT_LIMITS.heightError
             ) {
                 throw new Error(
                     "Registration markers do not match one A5 portrait ballot."
@@ -2731,7 +2731,7 @@ exports.uploadAndProcess = async (req, res) => {
             return fail(
                 422,
                 "Alignment failed. Retake the photo. " +
-                    error.message,
+                error.message,
                 (
                     process.env.OMR_TIMING_ENABLED === "true" &&
                     error.diagnostics
@@ -2793,12 +2793,33 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
+
         if (counting && votes.length === 0) {
+            // Hindi lahat ng zero valid votes ay blank ballot.
+            const shadedCount = positions.reduce(
+                (total, position) => total + position.marked,
+                0
+            );
+
+            const overvoteOnly = shadedCount > 0 &&
+                positions.some(position => position.overvoted);
+
+            const reason = overvoteOnly
+                ? "NO_VALID_VOTES_OVERVOTE"
+                : "BLANK_BALLOT";
+
             return fail(
                 422,
-                "Blank ballot detected. No votes counted. " +
-                "This ballot can still be used.",
+                overvoteOnly
+                    ? "No valid votes: shaded selections exceed the allowed limit. No votes saved."
+                    : "Blank ballot detected. No votes saved. Submit a marked ballot for scanning.",
                 {
+                    reason,
+                    selected_bubbles: shadedCount,
+                    overvotes: positions.filter(
+                        position => position.overvoted
+                    ).length,
+                    positions,
                     diagnostic: {
                         image: {
                             width: info.width,
@@ -2815,8 +2836,7 @@ exports.uploadAndProcess = async (req, res) => {
                                 candidate => ({
                                     name: candidate.name,
                                     contrast: candidate.contrast,
-                                    fill_intensity:
-                                        candidate.fill_intensity,
+                                    fill_intensity: candidate.fill_intensity,
                                     filled: candidate.filled,
                                     unclear: candidate.unclear
                                 })
@@ -3051,7 +3071,7 @@ exports.uploadAndProcess = async (req, res) => {
 
             ...(
                 preview &&
-                process.env.OMR_OPENCV_DIAGNOSTICS === "true"
+                    process.env.OMR_OPENCV_DIAGNOSTICS === "true"
                     ? {
                         opencv_diagnostic: openCvDiagnostic
                     }
