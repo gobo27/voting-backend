@@ -11,6 +11,35 @@ const VALID_SCHOOL_LEVELS = [
     "college"
 ];
 
+// Default scanner scopes para sa bawat bagong election.
+const SCHOOL_SCOPES = {
+    elementary: [
+        ["grade", "3", "Grade 3"],
+        ["grade", "4", "Grade 4"],
+        ["grade", "5", "Grade 5"],
+        ["grade", "6", "Grade 6"]
+    ],
+    highschool: [
+        ["grade", "7", "Grade 7"],
+        ["grade", "8", "Grade 8"],
+        ["grade", "9", "Grade 9"],
+        ["grade", "10", "Grade 10"],
+        ["grade", "11", "Grade 11"],
+        ["grade", "12", "Grade 12"]
+    ],
+    college: [
+        ["department", "BSCS", "BSCS"],
+        ["department", "BSCOE", "BSCoe"],
+        ["department", "BSN", "BSN"],
+        ["department", "BSA", "BSA"],
+        ["department", "BSBA", "BSBA"],
+        ["department", "BSED", "BSED"],
+        ["department", "BSTM", "BSTM"],
+        ["department", "BSHM", "BSHM"],
+        ["department", "BSPSYCH", "BSPsych"]
+    ]
+};
+
 function validId(value) {
     return Number.isSafeInteger(Number(value)) && Number(value) > 0;
 }
@@ -481,6 +510,18 @@ exports.create = async (req, res) => {
                 ]
             );
 
+            // Isabay ang grade/department scopes sa election transaction.
+            const scopes = SCHOOL_SCOPES[schoolLevel];
+
+            for (const [scopeType, scopeCode, scopeName] of scopes) {
+                await conn.execute(
+                    `INSERT INTO election_scopes
+                     (election_id, scope_type, scope_code, scope_name)
+                     VALUES (?, ?, ?, ?)`,
+                    [insert.insertId, scopeType, scopeCode, scopeName]
+                );
+            }
+
             // Positions lang ang kokopyahin, hindi candidates o votes
             if (copyId !== null) {
                 await conn.execute(
@@ -509,7 +550,8 @@ exports.create = async (req, res) => {
                 code: 201,
                 message: "New election created",
                 election_id: insert.insertId,
-                school_level: schoolLevel
+                school_level: schoolLevel,
+                scopes_created: scopes.length
             };
         });
 

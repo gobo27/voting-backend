@@ -1,10 +1,20 @@
+
 "use strict";
 
 const bcrypt = require("bcryptjs");
 const db = require("../../../config/db");
 const { sendCredentialsEmail } = require("./emailjs.server");
 
-const ALLOWED_ROLES = ["adviser", "committee", "super_admin"];
+const {
+    saveAssignments,
+    parseScopeIds
+} = require("./admin.assignments.controller");
+
+const ALLOWED_ROLES = [
+    "adviser",
+    "committee",
+    "super_admin"
+];
 
 const clean = value =>
     typeof value === "string" ? value.trim() : "";
@@ -21,8 +31,102 @@ function validatePassword(password) {
         Buffer.byteLength(password, "utf8") <= 72;
 }
 
+// Validate optional scope IDs
+function getScopeInput(body, role) {
+    const supplied = Object.prototype.hasOwnProperty.call(
+        body || {},
+        "scope_ids"
+    );
+
+    if (!supplied) {
+        return {
+            supplied: false,
+            ids: []
+        };
+    }
+
+    if (role !== "committee") {
+        const error = new Error(
+            "Department/grade assignments are only for Committee accounts."
+        );
+        error.status = 400;
+        throw error;
+    }
+
+    const ids = parseScopeIds(body.scope_ids);
+
+    if (!ids) {
+        const error = new Error(
+            "scope_ids must contain unique positive scope IDs."
+        );
+        error.status = 400;
+        throw error;
+    }
+
+    return {
+        supplied: true,
+        ids
+    };
+}
+
+// Lock current election kapag may assignment update
+async function getLockedElection(conn) {
+    const [rows] = await conn.execute(
+        `SELECT
+            election_id,
+            title,
+            school_level,
+            status,
+            is_active,
+            is_current,
+            archived_at
+         FROM elections
+         WHERE is_current = 1
+           AND archived_at IS NULL
+         LIMIT 1
+         FOR UPDATE`
+    );
+
+    return rows[0] || null;
+}
+
+function createError(message, status = 400) {
+    const error = new Error(message);
+    error.status = status;
+    return error;
+}
+
+function accountError(res, label, error) {
+    console.error(label, error);
+
+    if (error.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({
+            message: "Email or assignment already exists."
+        });
+    }
+
+    if (
+        error.code === "ER_ROW_IS_REFERENCED_2" ||
+        error.code === "ER_ROW_IS_REFERENCED"
+    ) {
+        return res.status(409).json({
+            message:
+                "This account has related records and cannot be deleted. Historical election records must be preserved."
+        });
+    }
+
+    return res.status(error.status || 500).json({
+        message: error.status
+            ? error.message
+            : "Database operation failed."
+    });
+}
+
 // CREATE ACCOUNT
 exports.createAccount = async (req, res) => {
+    let conn;
+    let transactionStarted = false;
+
     try {
         const name = clean(req.body?.name);
         const email = clean(req.body?.email).toLowerCase();
@@ -53,34 +157,86 @@ exports.createAccount = async (req, res) => {
 
         if (!validatePassword(password)) {
             return res.status(400).json({
-                message: "Temporary password must be at least 9 characters and at most 72 UTF-8 bytes."
+                message:
+                    "Temporary password must be at least 9 characters and at most 72 UTF-8 bytes."
             });
         }
 
-        const [existing] = await db.execute(
-            "SELECT id FROM users WHERE email = ? LIMIT 1",
+        const scopeInput = getScopeInput(req.body, role);
+
+        // Hash muna bago kumuha ng DB connection
+        const hash = await bcrypt.hash(password, 12);
+
+        conn = await db.getConnection();
+        await conn.beginTransaction();
+        transactionStarted = true;
+
+        let election = null;
+
+        // Election lock kapag may selected scopes
+        if (scopeInput.supplied && scopeInput.ids.length) {
+            election = await getLockedElection(conn);
+
+            if (!election) {
+                throw createError(
+                    "No current election available for assignments.",
+                    409
+                );
+            }
+        }
+
+        const [existing] = await conn.execute(
+            `SELECT id
+             FROM users
+             WHERE email = ?
+             LIMIT 1`,
             [email]
         );
 
         if (existing.length) {
-            return res.status(409).json({
-                message: "Email already exists."
-            });
+            throw createError(
+                "Email already exists.",
+                409
+            );
         }
 
-        const hash = await bcrypt.hash(password, 12);
-
-        const [result] = await db.execute(
+        // Save account sa same transaction
+        const [result] = await conn.execute(
             `INSERT INTO users
              (name, email, password, role, must_change_password)
              VALUES (?, ?, ?, ?, 1)`,
             [name, email, hash, role]
         );
 
+        const userId = result.insertId;
+
+        // Save Committee assignments atomically
+        if (
+            role === "committee" &&
+            scopeInput.supplied &&
+            scopeInput.ids.length
+        ) {
+            await saveAssignments(
+                conn,
+                userId,
+                election,
+                scopeInput.ids,
+                req.user.id
+            );
+        }
+
+        await conn.commit();
+        transactionStarted = false;
+
+        // Release connection bago mag-send ng email
+        conn.release();
+        conn = null;
+
         let emailSent = false;
         let emailRedirected = false;
         let emailError = null;
 
+        // Email lang pagkatapos ma-commit ang account
         try {
             const sent = await sendCredentialsEmail({
                 to: email,
@@ -94,8 +250,10 @@ exports.createAccount = async (req, res) => {
             emailRedirected = sent?.redirected === true;
 
             if (!emailSent) {
-                emailError = "Email service did not accept the message.";
+                emailError =
+                    "Email service did not accept the message.";
             }
+
         } catch (error) {
             emailError = error.message;
             console.error("EMAILJS ERROR:", error);
@@ -109,25 +267,34 @@ exports.createAccount = async (req, res) => {
             emailRedirected,
             ...(emailError ? { emailError } : {}),
             user: {
-                id: result.insertId,
+                id: userId,
                 name,
                 email,
                 role
-            }
+            },
+            scope_ids: scopeInput.ids
         });
 
     } catch (error) {
-        console.error("CREATE ACCOUNT ERROR:", error);
-
-        if (error.code === "ER_DUP_ENTRY") {
-            return res.status(409).json({
-                message: "Email already exists."
-            });
+        if (conn && transactionStarted) {
+            try {
+                await conn.rollback();
+            } catch (rollbackError) {
+                console.error(
+                    "CREATE ACCOUNT ROLLBACK ERROR:",
+                    rollbackError
+                );
+            }
         }
 
-        return res.status(500).json({
-            message: "Unable to create account."
-        });
+        return accountError(
+            res,
+            "CREATE ACCOUNT ERROR:",
+            error
+        );
+
+    } finally {
+        if (conn) conn.release();
     }
 };
 
@@ -137,24 +304,33 @@ exports.getAccounts = async (req, res) => {
         const [users] = await db.execute(
             `SELECT id, name, email, role
              FROM users
-             WHERE role IN ('adviser', 'committee', 'super_admin')
+             WHERE role IN (
+                 'adviser',
+                 'committee',
+                 'super_admin'
+             )
              ORDER BY id DESC`
         );
 
         return res.json({ users });
-    } catch (error) {
-        console.error("GET ACCOUNTS ERROR:", error);
 
-        return res.status(500).json({
-            message: "Unable to load accounts."
-        });
+    } catch (error) {
+        return accountError(
+            res,
+            "GET ACCOUNTS ERROR:",
+            error
+        );
     }
 };
 
 // EDIT ACCOUNT
 exports.updateAccount = async (req, res) => {
+    let conn;
+    let transactionStarted = false;
+
     try {
         const { id } = req.params;
+
         const name = clean(req.body?.name);
         const email = clean(req.body?.email).toLowerCase();
         const role = clean(req.body?.role).toLowerCase();
@@ -175,7 +351,8 @@ exports.updateAccount = async (req, res) => {
             !validEmail(email)
         ) {
             return res.status(400).json({
-                message: "Valid name, email and role are required."
+                message:
+                    "Valid name, email and role are required."
             });
         }
 
@@ -185,48 +362,108 @@ exports.updateAccount = async (req, res) => {
             });
         }
 
-        // Super Admin accounts are protected from editing here.
-        const [accounts] = await db.execute(
-            `SELECT id FROM users
-             WHERE id = ?
-             AND role IN ('adviser', 'committee')
-             LIMIT 1`,
-            [id]
-        );
+        const scopeInput = getScopeInput(req.body, role);
 
-        if (!accounts.length) {
-            return res.status(404).json({
-                message: "Account not found or protected."
+        const changingPassword =
+            password !== undefined &&
+            password !== null &&
+            password !== "";
+
+        if (
+            changingPassword &&
+            !validatePassword(password)
+        ) {
+            return res.status(400).json({
+                message:
+                    "Temporary password must be at least 9 characters and at most 72 UTF-8 bytes."
             });
         }
 
-        const [duplicate] = await db.execute(
-            `SELECT id FROM users
-             WHERE email = ? AND id <> ?
+        // Hash outside transaction para mas maikli DB lock
+        const hash = changingPassword
+            ? await bcrypt.hash(password, 12)
+            : null;
+
+        conn = await db.getConnection();
+        await conn.beginTransaction();
+        transactionStarted = true;
+
+        let election = null;
+
+        if (scopeInput.supplied) {
+            election = await getLockedElection(conn);
+
+            if (!election) {
+                throw createError(
+                    "No current election available.",
+                    409
+                );
+            }
+        }
+
+        // Protect Super Admin accounts
+        const [accounts] = await conn.execute(
+            `SELECT id, role
+             FROM users
+             WHERE id = ?
+             FOR UPDATE`,
+            [Number(id)]
+        );
+
+        if (
+            !accounts.length ||
+            !["adviser", "committee"].includes(
+                accounts[0].role
+            )
+        ) {
+            throw createError(
+                "Account not found or protected.",
+                404
+            );
+        }
+
+        const oldRole = accounts[0].role;
+
+        // Huwag iwan ang Committee history sa ibang role
+        if (
+            oldRole === "committee" &&
+            role !== "committee"
+        ) {
+            const [history] = await conn.execute(
+                `SELECT assignment_id
+                 FROM committee_scope_assignments
+                 WHERE committee_user_id = ?
+                 LIMIT 1`,
+                [Number(id)]
+            );
+
+            if (history.length) {
+                throw createError(
+                    "This Committee account has assignment history. Revoke its assignments and preserve the account role for audit purposes.",
+                    409
+                );
+            }
+        }
+
+        const [duplicate] = await conn.execute(
+            `SELECT id
+             FROM users
+             WHERE email = ?
+               AND id <> ?
              LIMIT 1`,
-            [email, id]
+            [email, Number(id)]
         );
 
         if (duplicate.length) {
-            return res.status(409).json({
-                message: "Email already used by another account."
-            });
+            throw createError(
+                "Email already used by another account.",
+                409
+            );
         }
 
-        if (
-            password !== undefined &&
-            password !== null &&
-            password !== ""
-        ) {
-            if (!validatePassword(password)) {
-                return res.status(400).json({
-                    message: "Temporary password must be at least 9 characters and at most 72 UTF-8 bytes."
-                });
-            }
-
-            const hash = await bcrypt.hash(password, 12);
-
-            await db.execute(
+        // Preserve optional password update
+        if (changingPassword) {
+            await conn.execute(
                 `UPDATE users
                  SET name = ?,
                      email = ?,
@@ -234,21 +471,35 @@ exports.updateAccount = async (req, res) => {
                      password = ?,
                      must_change_password = 1
                  WHERE id = ?
-                 AND role IN ('adviser', 'committee')`,
-                [name, email, role, hash, id]
+                   AND role IN ('adviser', 'committee')`,
+                [name, email, role, hash, Number(id)]
             );
 
         } else {
-            await db.execute(
+            await conn.execute(
                 `UPDATE users
                  SET name = ?,
                      email = ?,
                      role = ?
                  WHERE id = ?
-                 AND role IN ('adviser', 'committee')`,
-                [name, email, role, id]
+                   AND role IN ('adviser', 'committee')`,
+                [name, email, role, Number(id)]
             );
         }
+
+        // Update selected Committee assignments
+        if (role === "committee" && scopeInput.supplied) {
+            await saveAssignments(
+                conn,
+                Number(id),
+                election,
+                scopeInput.ids,
+                req.user.id
+            );
+        }
+
+        await conn.commit();
+        transactionStarted = false;
 
         return res.json({
             message: "Account updated successfully.",
@@ -257,28 +508,39 @@ exports.updateAccount = async (req, res) => {
                 name,
                 email,
                 role
-            }
+            },
+            ...(scopeInput.supplied
+                ? { scope_ids: scopeInput.ids }
+                : {})
         });
 
     } catch (error) {
-        console.error("UPDATE ACCOUNT ERROR:", error);
-
-        if (error.code === "ER_DUP_ENTRY") {
-            return res.status(409).json({
-                message: "Email already used by another account."
-            });
+        if (conn && transactionStarted) {
+            try {
+                await conn.rollback();
+            } catch (rollbackError) {
+                console.error(
+                    "UPDATE ACCOUNT ROLLBACK ERROR:",
+                    rollbackError
+                );
+            }
         }
 
-        return res.status(500).json({
-            message: "Unable to update account."
-        });
+        return accountError(
+            res,
+            "UPDATE ACCOUNT ERROR:",
+            error
+        );
+
+    } finally {
+        if (conn) conn.release();
     }
 };
 
-
- // DELETE ACCOUNT
+// DELETE ACCOUNT
 exports.deleteAccount = async (req, res) => {
     let conn;
+    let transactionStarted = false;
 
     try {
         const { id } = req.params;
@@ -289,51 +551,52 @@ exports.deleteAccount = async (req, res) => {
             });
         }
 
-        // Adjust these fields if your JWT uses different names.
         const loggedInId =
             req.user?.id ??
             req.user?.user_id;
 
         if (!validId(loggedInId)) {
             return res.status(403).json({
-                message: "Unable to verify your account identity."
+                message:
+                    "Unable to verify your account identity."
             });
         }
 
         if (Number(id) === Number(loggedInId)) {
             return res.status(403).json({
-                message: "You cannot delete your own account."
+                message:
+                    "You cannot delete your own account."
             });
         }
 
         conn = await db.getConnection();
         await conn.beginTransaction();
+        transactionStarted = true;
 
         const [target] = await conn.execute(
             `SELECT id, role
              FROM users
              WHERE id = ?
              FOR UPDATE`,
-            [id]
+            [Number(id)]
         );
 
         if (!target.length) {
-            await conn.rollback();
-            return res.status(404).json({
-                message: "Account not found."
-            });
+            throw createError(
+                "Account not found.",
+                404
+            );
         }
 
         if (!ALLOWED_ROLES.includes(target[0].role)) {
-            await conn.rollback();
-            return res.status(403).json({
-                message: "This account cannot be deleted."
-            });
+            throw createError(
+                "This account cannot be deleted.",
+                403
+            );
         }
 
+        // Huwag burahin ang last Super Admin
         if (target[0].role === "super_admin") {
-            // Lock the super admin rows to prevent
-            // simultaneous deletion of the last admin.
             const [admins] = await conn.execute(
                 `SELECT id
                  FROM users
@@ -343,47 +606,84 @@ exports.deleteAccount = async (req, res) => {
             );
 
             if (admins.length <= 1) {
-                await conn.rollback();
-                return res.status(403).json({
-                    message: "Cannot delete the last Super Admin."
-                });
+                throw createError(
+                    "Cannot delete the last Super Admin.",
+                    403
+                );
             }
+        }
+
+        // Preserve historical Committee assignments
+        const [committeeHistory] = await conn.execute(
+            `SELECT assignment_id
+             FROM committee_scope_assignments
+             WHERE committee_user_id = ?
+                OR assigned_by = ?
+             LIMIT 1`,
+            [Number(id), Number(id)]
+        );
+
+        const [adviserHistory] = await conn.execute(
+            `SELECT assignment_id
+             FROM election_adviser_assignments
+             WHERE adviser_user_id = ?
+                OR assigned_by = ?
+             LIMIT 1`,
+            [Number(id), Number(id)]
+        );
+
+        if (
+            committeeHistory.length ||
+            adviserHistory.length
+        ) {
+            throw createError(
+                "This account has election assignment history and cannot be permanently deleted.",
+                409
+            );
         }
 
         const [result] = await conn.execute(
             `DELETE FROM users
              WHERE id = ?
-             AND role IN ('adviser', 'committee', 'super_admin')`,
-            [id]
+               AND role IN (
+                   'adviser',
+                   'committee',
+                   'super_admin'
+               )`,
+            [Number(id)]
         );
 
         if (!result.affectedRows) {
-            await conn.rollback();
-            return res.status(404).json({
-                message: "Account not found."
-            });
+            throw createError(
+                "Account not found.",
+                404
+            );
         }
 
         await conn.commit();
+        transactionStarted = false;
 
         return res.json({
             message: "Account deleted successfully."
         });
 
     } catch (error) {
-        if (conn) {
+        if (conn && transactionStarted) {
             try {
                 await conn.rollback();
             } catch (rollbackError) {
-                console.error("ROLLBACK ERROR:", rollbackError);
+                console.error(
+                    "DELETE ACCOUNT ROLLBACK ERROR:",
+                    rollbackError
+                );
             }
         }
 
-        console.error("DELETE ACCOUNT ERROR:", error);
-
-        return res.status(500).json({
-            message: "Unable to delete account."
-        });
+        return accountError(
+            res,
+            "DELETE ACCOUNT ERROR:",
+            error
+        );
 
     } finally {
         if (conn) conn.release();
