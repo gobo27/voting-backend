@@ -57,16 +57,26 @@ async function resolveElection(conn, electionId) {
     return rows[0] || null;
 }
 
-// Bawal baguhin ang assignments ng completed election
+// Puwede mag-assign habang hindi finalized ang scanning.
 function canManageAssignments(election) {
-    return (
-        election &&
-        Number(election.is_current) === 1 &&
-        Number(election.is_active) === 0 &&
-        election.archived_at == null &&
-        election.status !== "active" &&
-        election.status !== "completed"
-    );
+    if (!election) return false;
+
+    // Dapat current election lang.
+    if (Number(election.is_current) !== 1) {
+        return false;
+    }
+
+    // Hindi puwedeng archived election.
+    if (election.archived_at) {
+        return false;
+    }
+
+    // Hindi puwede kapag finalized na ang scanning.
+    if (election.scanning_closed_at) {
+        return false;
+    }
+
+    return true;
 }
 
 // Validate lahat ng selected scopes
