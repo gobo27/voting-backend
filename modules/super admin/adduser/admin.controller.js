@@ -241,7 +241,7 @@ exports.createAccount = async (req, res) => {
             const sent = await sendCredentialsEmail({
                 to: email,
                 firstName: name,
-                userName: email,
+                userName: name,
                 password,
                 role
             });
