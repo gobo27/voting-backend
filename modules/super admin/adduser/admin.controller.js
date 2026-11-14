@@ -302,14 +302,58 @@ exports.createAccount = async (req, res) => {
 exports.getAccounts = async (req, res) => {
     try {
         const [users] = await db.execute(
-            `SELECT id, name, email, role
-             FROM users
-             WHERE role IN (
-                 'adviser',
-                 'committee',
-                 'super_admin'
+            `SELECT
+                u.id,
+                u.name,
+                u.email,
+                u.role,
+
+                GROUP_CONCAT(
+                    DISTINCT CASE
+                        WHEN e.election_id IS NOT NULL
+                        THEN e.school_level
+                    END
+                    ORDER BY e.school_level
+                    SEPARATOR ','
+                ) AS assigned_school_levels,
+
+                GROUP_CONCAT(
+                    DISTINCT CASE
+                        WHEN e.election_id IS NOT NULL
+                        THEN es.scope_name
+                    END
+                    ORDER BY es.scope_name
+                    SEPARATOR ', '
+                ) AS assigned_scopes
+
+             FROM users u
+
+             LEFT JOIN committee_scope_assignments csa
+                ON csa.committee_user_id = u.id
+                AND csa.is_active = 1
+
+             LEFT JOIN election_scopes es
+                ON es.scope_id = csa.scope_id
+                AND es.is_active = 1
+
+             LEFT JOIN elections e
+                ON e.election_id = es.election_id
+                AND e.is_current = 1
+                AND e.archived_at IS NULL
+
+             WHERE u.role IN (
+                'adviser',
+                'committee',
+                'super_admin'
              )
-             ORDER BY id DESC`
+
+             GROUP BY
+                u.id,
+                u.name,
+                u.email,
+                u.role
+
+             ORDER BY u.id DESC`
         );
 
         return res.json({ users });
