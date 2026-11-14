@@ -299,6 +299,7 @@ exports.createAccount = async (req, res) => {
 };
 
 // GET ACCOUNTS
+
 exports.getAccounts = async (req, res) => {
     try {
         const [users] = await db.execute(
@@ -310,16 +311,26 @@ exports.getAccounts = async (req, res) => {
 
                 GROUP_CONCAT(
                     DISTINCT CASE
-                        WHEN e.election_id IS NOT NULL
+                        WHEN u.role = 'committee'
+                            AND e.election_id IS NOT NULL
                         THEN e.school_level
+
+                        WHEN u.role = 'adviser'
+                            AND ae.election_id IS NOT NULL
+                        THEN ae.school_level
                     END
-                    ORDER BY e.school_level
+                    ORDER BY
+                        CASE
+                            WHEN u.role = 'committee' THEN e.school_level
+                            WHEN u.role = 'adviser' THEN ae.school_level
+                        END
                     SEPARATOR ','
                 ) AS assigned_school_levels,
 
                 GROUP_CONCAT(
                     DISTINCT CASE
-                        WHEN e.election_id IS NOT NULL
+                        WHEN u.role = 'committee'
+                            AND e.election_id IS NOT NULL
                         THEN es.scope_name
                     END
                     ORDER BY es.scope_name
@@ -328,6 +339,7 @@ exports.getAccounts = async (req, res) => {
 
              FROM users u
 
+             /* COMMITTEE ASSIGNMENTS */
              LEFT JOIN committee_scope_assignments csa
                 ON csa.committee_user_id = u.id
                 AND csa.is_active = 1
@@ -340,6 +352,15 @@ exports.getAccounts = async (req, res) => {
                 ON e.election_id = es.election_id
                 AND e.is_current = 1
                 AND e.archived_at IS NULL
+
+             /* ADVISER ELECTION ASSIGNMENTS */
+             LEFT JOIN election_adviser_assignments eaa
+                ON eaa.adviser_user_id = u.id
+
+             LEFT JOIN elections ae
+                ON ae.election_id = eaa.election_id
+                AND ae.is_current = 1
+                AND ae.archived_at IS NULL
 
              WHERE u.role IN (
                 'adviser',
