@@ -390,7 +390,374 @@ exports.archive = async (req, res) => {
         return fail(res, error);
     }
 };
+exports.downloadPdf = async (req, res) => {
+    const electionId = Number(req.params.id);
 
+    if (!validId(electionId)) {
+        return res.status(400).json({
+            message: "Invalid election ID"
+        });
+    }
+
+    try {
+        const {
+            fetchReportData,
+            createPdf
+        } = require("./electionReport.service");
+
+        const data = await fetchReportData(electionId);
+
+        if (!data) {
+            return res.status(404).json({
+                message: "Election not found"
+            });
+        }
+
+        const pdfBuffer = await createPdf(data);
+
+        res.set({
+            "Content-Type": "application/pdf",
+            "Content-Disposition":
+                `attachment; filename="election-report-${electionId}.pdf"`,
+            "Content-Length": String(pdfBuffer.length),
+            "Cache-Control": "no-store"
+        });
+
+        return res.send(pdfBuffer);
+
+    } catch (error) {
+        console.error("PDF REPORT ERROR:", error);
+
+        if (!res.headersSent) {
+            return res.status(500).json({
+                message: "Unable to generate election PDF report."
+            });
+        }
+    }
+};
+const reportJwt = require("jsonwebtoken");
+
+const {
+    sendElectionReportEmail
+} = require("../adduser/emailjs.server");
+
+function reportError(res, error) {
+    console.error("ELECTION REPORT ERROR:", error);
+
+    return res.status(error.status || 500).json({
+        message: error.status
+            ? error.message
+            : "Unable to process election report request."
+    });
+}
+
+// Get Advisers assigned to an election
+exports.reportAdvisers = async (req, res) => {
+    const electionId = Number(req.params.id);
+
+    if (!validId(electionId)) {
+        return res.status(400).json({
+            message: "Invalid election ID."
+        });
+    }
+
+    try {
+        const [advisers] = await db.execute(
+            `SELECT DISTINCT
+                u.id,
+                u.name,
+                u.email
+             FROM election_adviser_assignments a
+             JOIN users u
+               ON u.id = a.adviser_user_id
+             WHERE a.election_id = ?
+               AND a.is_active = 1
+               AND u.role = 'adviser'
+             ORDER BY u.name, u.id`,
+            [electionId]
+        );
+
+        return res.json({ advisers });
+
+    } catch (error) {
+        return reportError(res, error);
+    }
+};
+
+// Send secure PDF links to selected Advisers
+exports.notifyReportAdvisers = async (req, res) => {
+    const electionId = Number(req.params.id);
+    const adviserIds = req.body?.adviser_ids;
+
+    if (!validId(electionId)) {
+        return res.status(400).json({
+            message: "Invalid election ID."
+        });
+    }
+
+    if (
+        !Array.isArray(adviserIds) ||
+        adviserIds.length < 1 ||
+        adviserIds.length > 20 ||
+        adviserIds.some(id => !validId(id)) ||
+        new Set(adviserIds.map(Number)).size !== adviserIds.length
+    ) {
+        return res.status(400).json({
+            message: "Select 1 to 20 unique Adviser IDs."
+        });
+    }
+
+    const secret = process.env.REPORT_LINK_SECRET;
+    const apiBase = process.env.REPORT_PUBLIC_API_BASE;
+
+    if (
+        !secret ||
+        Buffer.byteLength(secret, "utf8") < 32 ||
+        !apiBase ||
+        !apiBase.startsWith("https://")
+    ) {
+        return res.status(503).json({
+            message: "Secure report link is not configured."
+        });
+    }
+
+    try {
+        const [elections] = await db.execute(
+            `SELECT election_id, title, school_level,
+                    status, archived_at,
+                    voting_closed_at, scanning_open,
+                    scanning_closed_at
+             FROM elections
+             WHERE election_id = ?
+             LIMIT 1`,
+            [electionId]
+        );
+
+        const election = elections[0];
+
+        if (!election) {
+            return res.status(404).json({
+                message: "Election not found."
+            });
+        }
+
+        if (
+            election.archived_at ||
+            election.status !== "completed" ||
+            !election.voting_closed_at ||
+            Number(election.scanning_open) !== 0 ||
+            !election.scanning_closed_at
+        ) {
+            return res.status(409).json({
+                message:
+                    "Finish voting and scanning before sending the report."
+            });
+        }
+
+        const [pending] = await db.execute(
+            `SELECT COUNT(*) AS total
+             FROM issued_ballots
+             WHERE election_id = ?
+               AND status = 'CAST'`,
+            [electionId]
+        );
+
+        if (Number(pending[0].total) > 0) {
+            return res.status(409).json({
+                message: "Some received ballots are not yet counted."
+            });
+        }
+
+        const placeholders = adviserIds.map(() => "?").join(",");
+
+        const [advisers] = await db.query(
+            `SELECT DISTINCT u.id, u.name, u.email
+             FROM election_adviser_assignments a
+             JOIN users u ON u.id = a.adviser_user_id
+             WHERE a.election_id = ?
+               AND a.is_active = 1
+               AND u.role = 'adviser'
+               AND u.id IN (${placeholders})`,
+            [electionId, ...adviserIds.map(Number)]
+        );
+
+        if (advisers.length !== adviserIds.length) {
+            return res.status(400).json({
+                message:
+                    "One or more selected Advisers are not actively assigned."
+            });
+        }
+
+        const results = [];
+
+        for (const adviser of advisers) {
+            try {
+                // Signed link valid for 7 days
+                const signedToken = reportJwt.sign(
+                    {
+                        election_id: electionId,
+                        adviser_id: adviser.id,
+                        purpose: "election_pdf"
+                    },
+                    secret,
+                    {
+                        algorithm: "HS256",
+                        expiresIn: "7d",
+                        issuer: "campusvote",
+                        audience: "election-report"
+                    }
+                );
+
+                const reportUrl =
+                    `${apiBase.replace(/\/+$/, "")}` +
+                    `/election_archive/report-download` +
+                    `?token=${encodeURIComponent(signedToken)}`;
+
+                const sent = await sendElectionReportEmail({
+                    to: adviser.email,
+                    adviserName: adviser.name,
+                    electionTitle: election.title,
+                    schoolLevel: election.school_level,
+                    reportUrl
+                });
+
+                results.push({
+                    adviser_id: adviser.id,
+                    name: adviser.name,
+                    accepted: sent.sent === true
+                });
+
+            } catch (error) {
+                console.error(
+                    "REPORT EMAIL FAILED:",
+                    adviser.id,
+                    error.message
+                );
+
+                results.push({
+                    adviser_id: adviser.id,
+                    name: adviser.name,
+                    accepted: false
+                });
+            }
+        }
+
+        const acceptedCount =
+            results.filter(item => item.accepted).length;
+
+        return res.status(
+            acceptedCount === advisers.length ? 200 : 207
+        ).json({
+            message:
+                `${acceptedCount} of ${advisers.length} ` +
+                "report email requests accepted by EmailJS.",
+            accepted_count: acceptedCount,
+            total: advisers.length,
+            results,
+            archived: false
+        });
+
+    } catch (error) {
+        return reportError(res, error);
+    }
+};
+
+// Download using a signed expiring link
+exports.downloadSignedReport = async (req, res) => {
+    const signedToken = String(req.query?.token || "");
+
+    if (!signedToken || signedToken.length > 4096) {
+        return res.status(400).json({
+            message: "Invalid report link."
+        });
+    }
+
+    try {
+        const secret = process.env.REPORT_LINK_SECRET;
+
+        if (!secret || Buffer.byteLength(secret, "utf8") < 32) {
+            return res.status(503).json({
+                message: "Report link service unavailable."
+            });
+        }
+
+        const payload = reportJwt.verify(signedToken, secret, {
+            algorithms: ["HS256"],
+            issuer: "campusvote",
+            audience: "election-report"
+        });
+
+        if (
+            payload.purpose !== "election_pdf" ||
+            !validId(payload.election_id) ||
+            !validId(payload.adviser_id)
+        ) {
+            return res.status(403).json({
+                message: "Invalid report authorization."
+            });
+        }
+
+        // Check that recipient has an assignment record
+        const [assignments] = await db.execute(
+            `SELECT a.assignment_id
+             FROM election_adviser_assignments a
+             JOIN users u ON u.id = a.adviser_user_id
+             WHERE a.election_id = ?
+               AND a.adviser_user_id = ?
+               AND u.role = 'adviser'
+             LIMIT 1`,
+            [payload.election_id, payload.adviser_id]
+        );
+
+        if (!assignments.length) {
+            return res.status(403).json({
+                message: "Report access denied."
+            });
+        }
+
+        const {
+            fetchReportData,
+            createPdf
+        } = require("./electionReport.service");
+
+        const reportData = await fetchReportData(
+            payload.election_id
+        );
+
+        if (!reportData) {
+            return res.status(404).json({
+                message: "Election not found."
+            });
+        }
+
+        const pdfBuffer = await createPdf(reportData);
+
+        res.set({
+            "Content-Type": "application/pdf",
+            "Content-Disposition":
+                `attachment; filename="election-report-${payload.election_id}.pdf"`,
+            "Content-Length": String(pdfBuffer.length),
+            "Cache-Control": "no-store, private",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff"
+        });
+
+        return res.send(pdfBuffer);
+
+    } catch (error) {
+        if (
+            error.name === "TokenExpiredError" ||
+            error.name === "JsonWebTokenError" ||
+            error.name === "NotBeforeError"
+        ) {
+            return res.status(403).json({
+                message: "Report link is invalid or expired."
+            });
+        }
+
+        return reportError(res, error);
+    }
+};
 // Create election na may school level
 exports.create = async (req, res) => {
     const title = String(req.body?.title || "").trim();

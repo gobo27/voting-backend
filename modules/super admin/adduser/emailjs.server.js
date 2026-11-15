@@ -97,9 +97,98 @@ async function sendPasswordResetOtpEmail({ to, otp }) {
 
     return { sent: true };
 }
+async function sendElectionReportEmail({
+    to,
+    adviserName,
+    electionTitle,
+    schoolLevel,
+    reportUrl
+}) {
+    const {
+        EMAILJS_SERVICE_ID,
+        EMAILJS_CONTACT_TEMPLATE_ID,
+        EMAILJS_PUBLIC_KEY,
+        EMAILJS_PRIVATE_KEY
+    } = process.env;
 
+    if (
+        !EMAILJS_SERVICE_ID ||
+        !EMAILJS_CONTACT_TEMPLATE_ID ||
+        !EMAILJS_PUBLIC_KEY ||
+        !EMAILJS_PRIVATE_KEY
+    ) {
+        throw new Error(
+            "Election report EmailJS configuration is incomplete."
+        );
+    }
+
+    if (
+        !to ||
+        !adviserName ||
+        !electionTitle ||
+        !reportUrl
+    ) {
+        throw new Error(
+            "Missing election report email information."
+        );
+    }
+
+    const subject =
+        `Official Election Report - ${electionTitle}`;
+
+    const message = [
+        `Dear ${adviserName},`,
+        "",
+        "Greetings!",
+        "",
+        "The election report is available for review.",
+        "",
+        `Election: ${electionTitle}`,
+        `School Level: ${schoolLevel}`,
+        "",
+        "Download your PDF report using this secure link:",
+        reportUrl,
+        "",
+        "The link expires after 7 days.",
+        "Please do not share this link with others.",
+        "",
+        "Thank you.",
+        "",
+        "CampusVote Administration"
+    ].join("\n");
+
+    const response = await emailjs.send(
+        EMAILJS_SERVICE_ID,
+        EMAILJS_CONTACT_TEMPLATE_ID,
+        {
+            to_email: to,
+            to_name: adviserName,
+            subject,
+            message,
+            report_url: reportUrl,
+            election_title: electionTitle,
+            school_level: schoolLevel
+        },
+        {
+            publicKey: EMAILJS_PUBLIC_KEY,
+            privateKey: EMAILJS_PRIVATE_KEY
+        }
+    );
+
+    if (response?.status !== 200) {
+        throw new Error(
+            "EmailJS did not accept the election report email."
+        );
+    }
+
+    return {
+        sent: true,
+        acceptedByProvider: true
+    };
+}
 
 module.exports = {
     sendCredentialsEmail,
-    sendPasswordResetOtpEmail
+    sendPasswordResetOtpEmail,
+    sendElectionReportEmail
 };

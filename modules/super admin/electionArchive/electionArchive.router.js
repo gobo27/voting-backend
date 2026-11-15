@@ -11,17 +11,14 @@ router.use(
     verifyToken,
     verifyToken.requireRole("super_admin")
 );
-
-// ELECTION HISTORY
+router.get("/report-download",controller.downloadSignedReport);
 router.get("/", controller.list);
-
-// VIEW RESULTS, BALLOTS AND CANDIDATES
 router.get("/:id/details", controller.details);
-
-// ARCHIVE ELECTION
+router.get("/:id/report-advisers",controller.reportAdvisers);
+// Send report links to selected Advisers
+router.post("/:id/notify-advisers",controller.notifyReportAdvisers);
+router.get("/:id/report.pdf", controller.downloadPdf);
 router.post("/:id/archive", controller.archive);
-
-// CREATE NEW ELECTION
 router.post("/", controller.create);
 
 module.exports = router;
