@@ -1,5 +1,6 @@
 "use strict";
-
+const crypto = require("node:crypto");
+const jwt = require("jsonwebtoken");
 const sharp = require("sharp");
 const { Worker } = require("node:worker_threads");
 const { analyzeBubbles } = require("./omr_opencv");
@@ -50,6 +51,92 @@ function parseQR(qrData) {
         ballot_id: parts[2].toLowerCase(),
         template_id: Number(parts[3])
     };
+}
+
+async function assertBallotScopeAccess(
+    db,
+    user,
+    ballot,
+    lock = false
+) {
+    function deny(message) {
+        const error = new Error(message);
+
+        error.httpStatus = 403;
+        error.scopeDenied = true;
+
+        throw error;
+    }
+
+    if (!user || !validId(user.id)) {
+        deny("Invalid scanner account.");
+    }
+
+    // Super Admin can scan all departments.
+    if (user.role === "super_admin") {
+        return;
+    }
+
+    if (user.role !== "committee") {
+        deny("You are not authorized to scan ballots.");
+    }
+
+    const electionId = Number(ballot.election_id);
+    const scopeId = Number(ballot.scope_id);
+
+    // Preserve compatibility with existing SSC ballots.
+    // This exception applies only to the old batch 23.
+    if (ballot.scope_id === null) {
+        if (
+            electionId === 11 &&
+            Number(ballot.batch_id) === 23
+        ) {
+            return;
+        }
+
+        deny(
+            "This ballot has no assigned department or grade."
+        );
+    }
+
+    if (!validId(scopeId)) {
+        deny("Invalid ballot department or grade.");
+    }
+
+    const [assignments] = await db.execute(
+        `SELECT
+            a.assignment_id,
+            s.scope_name
+
+         FROM committee_scope_assignments a
+
+         INNER JOIN election_scopes s
+            ON s.scope_id = a.scope_id
+
+         WHERE a.committee_user_id = ?
+           AND a.scope_id = ?
+           AND s.election_id = ?
+           AND a.is_active = 1
+           AND a.revoked_at IS NULL
+           AND s.is_active = 1
+
+         LIMIT 1
+         ${lock ? "FOR UPDATE" : ""}`,
+
+        [
+            Number(user.id),
+            scopeId,
+            electionId
+        ]
+    );
+
+    if (!assignments.length) {
+        deny(
+            "Unauthorized ballot. This department " +
+            "or grade is not assigned to your account. " +
+            "No votes saved."
+        );
+    }
 }
 
 /* CONSERVATIVE PAPER CROP */
@@ -2267,17 +2354,14 @@ exports.verifyQR = async (req, res) => {
         const qr = parseQR(req.body?.qr_data);
 
         const [rows] = await pool.execute(
-            `SELECT ballot_id, election_id, template_id, status
+            `SELECT ballot_id, election_id, template_id,
+                    batch_id, scope_id, serial_number, status
              FROM issued_ballots
              WHERE ballot_id = ?
                AND election_id = ?
                AND template_id = ?
              LIMIT 1`,
-            [
-                qr.ballot_id,
-                qr.election_id,
-                qr.template_id
-            ]
+            [qr.ballot_id, qr.election_id, qr.template_id]
         );
 
         if (!rows.length) {
@@ -2288,6 +2372,12 @@ exports.verifyQR = async (req, res) => {
         }
 
         const ballot = rows[0];
+
+        await assertBallotScopeAccess(
+            pool,
+            req.user,
+            ballot
+        );
 
         if (ballot.status === "COUNTED") {
             return res.status(409).json({
@@ -2321,9 +2411,20 @@ exports.verifyQR = async (req, res) => {
             ballot_id: ballot.ballot_id,
             election_id: ballot.election_id,
             template_id: ballot.template_id,
+            scope_id: ballot.scope_id,
+            serial_number: ballot.serial_number,
             message: "Valid ballot. Ready for OMR analysis."
         });
+
     } catch (error) {
+        if (error.scopeDenied) {
+            return res.status(403).json({
+                valid: false,
+                scope_denied: true,
+                message: error.message
+            });
+        }
+
         const invalid =
             error.message ===
             "Invalid CampusVote ballot QR code.";
@@ -2494,8 +2595,10 @@ exports.uploadAndProcess = async (req, res) => {
 
         db = await pool.getConnection();
 
+
         const [ballots] = await db.execute(
-            `SELECT status
+            `SELECT ballot_id, election_id, template_id,
+                    batch_id, scope_id, serial_number, status
              FROM issued_ballots
              WHERE ballot_id = ?
                AND election_id = ?
@@ -2510,6 +2613,12 @@ exports.uploadAndProcess = async (req, res) => {
                 "Unregistered ballot."
             );
         }
+
+        await assertBallotScopeAccess(
+            db,
+            req.user,
+            ballots[0]
+        );
 
         const ballotStatus = ballots[0].status;
 
@@ -2775,77 +2884,149 @@ exports.uploadAndProcess = async (req, res) => {
 
         const { positions, votes } = analysis;
 
+
         const needsReview = positions.filter(
             position => position.unclear
         );
 
-        if (counting && needsReview.length) {
+        const isBlankBallot =
+            positions.length > 0 &&
+            positions.every(
+                position => position.result === "BLANK"
+            );
+
+        if (needsReview.length > 0) {
             return fail(
                 422,
-                "Unclear shading detected. No votes saved. Retake or rescan the ballot.",
+                "Unclear shading detected. Please retake the ballot.",
                 {
                     review_required: true,
-                    positions,
-                    unclear_positions: needsReview.map(
-                        position => position.position_name
-                    )
+                    positions
                 }
             );
         }
 
-
-        if (counting && votes.length === 0) {
-            // Hindi lahat ng zero valid votes ay blank ballot.
-            const shadedCount = positions.reduce(
-                (total, position) => total + position.marked,
-                0
-            );
-
-            const overvoteOnly = shadedCount > 0 &&
-                positions.some(position => position.overvoted);
-
-            const reason = overvoteOnly
-                ? "NO_VALID_VOTES_OVERVOTE"
-                : "BLANK_BALLOT";
-
+        if (votes.length === 0 && !isBlankBallot) {
             return fail(
                 422,
-                overvoteOnly
-                    ? "No valid votes: shaded selections exceed the allowed limit. No votes saved."
-                    : "Blank ballot detected. No votes saved. Submit a marked ballot for scanning.",
+                "No valid votes detected.",
                 {
-                    reason,
-                    selected_bubbles: shadedCount,
-                    overvotes: positions.filter(
-                        position => position.overvoted
-                    ).length,
                     positions,
-                    diagnostic: {
-                        image: {
-                            width: info.width,
-                            height: info.height
-                        },
-                        registration_marks: marks.map(mark => ({
-                            x: Math.round(mark.x * 10) / 10,
-                            y: Math.round(mark.y * 10) / 10
-                        })),
-                        positions: positions.map(position => ({
-                            position: position.position_name,
-                            result: position.result,
-                            candidates: position.candidates.map(
-                                candidate => ({
-                                    name: candidate.name,
-                                    contrast: candidate.contrast,
-                                    fill_intensity: candidate.fill_intensity,
-                                    filled: candidate.filled,
-                                    unclear: candidate.unclear
-                                })
-                            )
-                        }))
-                    }
+                    reason: "NO_VALID_VOTES"
                 }
             );
         }
+
+        // Bind the review to the exact uploaded image.
+        const imageHash = crypto
+            .createHash("sha256")
+            .update(await fs.readFile(req.file.path))
+            .digest("hex");
+
+        // Bind the review to the detected selections.
+        const reviewPositions = positions.map(position => ({
+            position_id: Number(position.position_id),
+            result: position.result,
+
+            selected: position.candidates
+                .filter(candidate => candidate.filled)
+                .map(candidate => Number(candidate.candidate_id))
+                .sort((a, b) => a - b)
+        })).sort(
+            (a, b) => a.position_id - b.position_id
+        );
+
+        const reviewHash = crypto
+            .createHash("sha256")
+            .update(JSON.stringify(reviewPositions))
+            .digest("hex");
+
+        const reviewSecret = crypto
+            .createHmac("sha256", process.env.JWT_SECRET)
+            .update("campusvote-ballot-review-v1")
+            .digest();
+
+        let reviewToken = null;
+
+        if (preview) {
+            const [[currentElection]] = await pool.execute(
+                `SELECT status, scanning_open,
+                scanning_closed_at, is_current,
+                archived_at
+         FROM elections
+         WHERE election_id = ?`,
+                [electionId]
+            );
+
+            const canConfirm =
+                process.env.OMR_COUNTING_ENABLED === "true" &&
+                currentElection &&
+                Number(currentElection.is_current) === 1 &&
+                Number(currentElection.scanning_open) === 1 &&
+                !currentElection.scanning_closed_at &&
+                !currentElection.archived_at &&
+                ["active", "completed"].includes(
+                    String(currentElection.status).toLowerCase()
+                );
+
+            if (canConfirm) {
+                reviewToken = jwt.sign(
+                    {
+                        purpose: "ballot_review",
+                        user_id: Number(req.user.id),
+                        election_id: electionId,
+                        template_id: templateId,
+                        ballot_id: qr.ballot_id,
+                        scope_id: ballots[0].scope_id,
+                        image_hash: imageHash,
+                        review_hash: reviewHash
+                    },
+                    reviewSecret,
+                    {
+                        algorithm: "HS256",
+                        audience: "campusvote-omr",
+                        expiresIn: "10m"
+                    }
+                );
+            }
+        }
+
+        if (counting) {
+            let review;
+
+            try {
+                review = jwt.verify(
+                    String(req.body?.review_token || ""),
+                    reviewSecret,
+                    {
+                        algorithms: ["HS256"],
+                        audience: "campusvote-omr"
+                    }
+                );
+            } catch (_) {
+                return fail(
+                    403,
+                    "Ballot review is missing or expired. Scan and validate again."
+                );
+            }
+
+            if (
+                review.purpose !== "ballot_review" ||
+                review.user_id !== Number(req.user.id) ||
+                review.election_id !== electionId ||
+                review.template_id !== templateId ||
+                review.ballot_id !== qr.ballot_id ||
+                review.scope_id !== ballots[0].scope_id ||
+                review.image_hash !== imageHash ||
+                review.review_hash !== reviewHash
+            ) {
+                return fail(
+                    403,
+                    "Ballot does not match the reviewed scan. Validate again."
+                );
+            }
+        }
+
 
         if (counting) {
             db = await pool.getConnection();
@@ -2856,13 +3037,13 @@ exports.uploadAndProcess = async (req, res) => {
             const [elections] = await db.execute(
                 `SELECT
                     status,
-                    scanning_open,
-                    scanning_closed_at,
-                    is_current,
-                    archived_at
+            scanning_open,
+            scanning_closed_at,
+            is_current,
+            archived_at
                  FROM elections
                  WHERE election_id = ?
-                 LIMIT 1
+            LIMIT 1
                  FOR UPDATE`,
                 [electionId]
             );
@@ -2886,8 +3067,10 @@ exports.uploadAndProcess = async (req, res) => {
                 );
             }
 
+
             const [locked] = await db.execute(
-                `SELECT status
+                `SELECT ballot_id, election_id, template_id,
+                        batch_id, scope_id, status
                  FROM issued_ballots
                  WHERE ballot_id = ?
                    AND election_id = ?
@@ -2901,6 +3084,19 @@ exports.uploadAndProcess = async (req, res) => {
                 reject(
                     422,
                     "Unregistered ballot."
+                );
+            }
+
+            await assertBallotScopeAccess(
+                db,
+                req.user,
+                locked[0],
+                true
+            );
+            if (locked[0].scope_id !== ballots[0].scope_id) {
+                reject(
+                    409,
+                    "Ballot department changed. Validate again."
                 );
             }
 
@@ -2919,84 +3115,85 @@ exports.uploadAndProcess = async (req, res) => {
                 );
             }
 
-            // Batch validation retains exact candidate-position checks.
-            const candidateIds = votes.map(
-                vote => vote.candidate_id
-            );
+            // Save candidate votes only when selections exist.
+            if (votes.length > 0) {
+                const candidateIds = votes.map(
+                    vote => vote.candidate_id
+                );
 
-            const candidatePlaceholders =
-                candidateIds.map(() => "?").join(",");
+                const candidatePlaceholders =
+                    candidateIds.map(() => "?").join(",");
 
-            const [candidateRows] = await db.execute(
-                `SELECT c.candidate_id, c.position_id
-                 FROM candidates c
-                 INNER JOIN positions p
-                   ON p.position_id = c.position_id
-                 WHERE c.candidate_id IN (${candidatePlaceholders})
-                   AND c.election_id = ?
-                   AND p.election_id = ?`,
-                [
-                    ...candidateIds,
-                    electionId,
-                    electionId
-                ]
-            );
+                const [candidateRows] = await db.execute(
+                    `SELECT c.candidate_id, c.position_id
+         FROM candidates c
+         INNER JOIN positions p
+            ON p.position_id = c.position_id
+         WHERE c.candidate_id IN (${candidatePlaceholders})
+           AND c.election_id = ?
+           AND p.election_id = ?`,
+                    [
+                        ...candidateIds,
+                        electionId,
+                        electionId
+                    ]
+                );
 
-            const validCandidates = new Map(
-                candidateRows.map(row => [
-                    Number(row.candidate_id),
-                    Number(row.position_id)
-                ])
-            );
+                const validCandidates = new Map(
+                    candidateRows.map(row => [
+                        Number(row.candidate_id),
+                        Number(row.position_id)
+                    ])
+                );
 
-            if (
-                votes.some(vote =>
-                    validCandidates.get(vote.candidate_id) !==
-                    vote.position_id
-                )
-            ) {
-                reject(
-                    422,
-                    "Invalid candidate or position for this election."
+                if (
+                    votes.some(vote =>
+                        validCandidates.get(vote.candidate_id) !==
+                        vote.position_id
+                    )
+                ) {
+                    reject(
+                        422,
+                        "Invalid candidate or position for this election."
+                    );
+                }
+
+                const votePlaceholders = votes.map(
+                    () => "(?, ?, ?, ?)"
+                ).join(",");
+
+                const voteValues = votes.flatMap(vote => [
+                    qr.ballot_id,
+                    vote.candidate_id,
+                    vote.position_id,
+                    vote.fill_intensity
+                ]);
+
+                await db.execute(
+                    `INSERT INTO ballot_votes (
+            ballot_id,
+            candidate_id,
+            position_id,
+            fill_intensity
+        )
+        VALUES ${votePlaceholders}`,
+                    voteValues
                 );
             }
 
-            const votePlaceholders = votes.map(
-                () => "(?, ?, ?, ?)"
-            ).join(",");
-
-            const voteValues = votes.flatMap(vote => [
-                qr.ballot_id,
-                vote.candidate_id,
-                vote.position_id,
-                vote.fill_intensity
-            ]);
-
-            await db.execute(
-                `INSERT INTO ballot_votes
-                    (
-                        ballot_id,
-                        candidate_id,
-                        position_id,
-                        fill_intensity
-                    )
-                 VALUES ${votePlaceholders}`,
-                voteValues
-            );
-
             const [updated] = await db.execute(
                 `UPDATE issued_ballots
-                 SET
-                    status = 'COUNTED',
-                    counted_at = CURRENT_TIMESTAMP,
-                    cast_at = COALESCE(
-                        cast_at,
-                        CURRENT_TIMESTAMP
-                    )
+            SET
+            status = 'COUNTED',
+                counted_at = CURRENT_TIMESTAMP,
+                cast_at = COALESCE(
+                    cast_at,
+                    CURRENT_TIMESTAMP
+                )
                  WHERE ballot_id = ?
-                   AND election_id = ?
-                   AND template_id = ?
-                   AND status IN ('ISSUED', 'CAST')`,
+                AND election_id = ?
+                    AND template_id = ?
+                        AND status IN('ISSUED', 'CAST')`,
                 [qr.ballot_id, electionId, templateId]
             );
 
@@ -3066,6 +3263,15 @@ exports.uploadAndProcess = async (req, res) => {
             ),
 
             saved_votes: counting ? votes.length : 0,
+            review_token: reviewToken,
+            can_confirm: preview && Boolean(reviewToken),
+            detected_votes: votes.length,
+
+            blank_ballot: isBlankBallot,
+
+            blank_positions: positions.filter(
+                position => position.result === "BLANK"
+            ).length,
 
             positions,
 
@@ -3079,8 +3285,11 @@ exports.uploadAndProcess = async (req, res) => {
             ),
 
             message: counting
-                ? `Ballot counted. ${votes.length} votes saved.`
-                : `Preview complete. ${votes.length} valid votes detected. Nothing saved.`
+                ? `Ballot counted successfully. ${votes.length} votes saved.`
+                : reviewToken
+                    ? "Validation successful. Review the detected selections before counting."
+                    : "Preview complete. Counting is currently unavailable."
+
         });
     } catch (error) {
         if (db && transactionStarted) {
@@ -3106,7 +3315,8 @@ exports.uploadAndProcess = async (req, res) => {
                 error.message,
                 {
                     duplicate:
-                        error.duplicate === true
+                        error.duplicate === true,
+                    scope_denied: error.scopeDenied === true
                 }
             );
         }
@@ -3176,7 +3386,7 @@ exports.getLiveTallies = async (req, res) => {
             `SELECT election_id
              FROM elections
              WHERE election_id = ?
-             LIMIT 1`,
+                LIMIT 1`,
             [electionId]
         );
 
@@ -3189,11 +3399,11 @@ exports.getLiveTallies = async (req, res) => {
 
         const [rows] = await pool.execute(
             `SELECT
-                p.position_id,
+            p.position_id,
                 p.title AS position_name,
-                c.candidate_id,
-                c.name AS candidate_name,
-                COUNT(DISTINCT bv.ballot_id) AS total_votes
+                    c.candidate_id,
+                    c.name AS candidate_name,
+                        COUNT(DISTINCT bv.ballot_id) AS total_votes
              FROM positions p
              INNER JOIN candidates c
                 ON c.position_id = p.position_id
@@ -3201,23 +3411,23 @@ exports.getLiveTallies = async (req, res) => {
              LEFT JOIN ballot_votes bv
                 ON bv.position_id = p.position_id
                AND bv.candidate_id = c.candidate_id
-               AND EXISTS (
-                   SELECT 1
+               AND EXISTS(
+                            SELECT 1
                    FROM issued_ballots ib
                    WHERE ib.ballot_id = bv.ballot_id
                      AND ib.election_id = p.election_id
                      AND ib.status = 'COUNTED'
-               )
+                        )
              WHERE p.election_id = ?
-             GROUP BY
-                p.position_id,
+                GROUP BY
+            p.position_id,
                 p.title,
                 c.candidate_id,
                 c.name
              ORDER BY
-                p.position_id ASC,
+            p.position_id ASC,
                 total_votes DESC,
-                c.name ASC`,
+                    c.name ASC`,
             [electionId]
         );
 
