@@ -526,36 +526,90 @@ exports.getAnalytics = async (req, res) => {
                 )
                 : null;
 
-        // Cumulative counting time series
-        const [timeRows] =
-            await connection.execute(
-                `SELECT
-                    FLOOR(
-                        UNIX_TIMESTAMP(ib.counted_at) / 3600
-                    ) * 3600 AS hour_start,
 
-                    COUNT(*) AS ballots
+        const [timeRows] = await connection.execute(
+            `SELECT
+        ib.scope_id,
 
-                 FROM issued_ballots ib
-                 WHERE ib.election_id = ?
-                   AND ib.status = 'COUNTED'
-                   AND ib.counted_at IS NOT NULL
-                   ${scopeCondition}
+        FLOOR(
+            UNIX_TIMESTAMP(ib.counted_at) / 3600
+        ) * 3600 AS hour_start,
 
-                 GROUP BY hour_start
-                 ORDER BY hour_start`,
-                params
+        COUNT(*) AS ballots
+
+     FROM issued_ballots ib
+
+     WHERE ib.election_id = ?
+       AND ib.status = 'COUNTED'
+       AND ib.counted_at IS NOT NULL
+
+       ${scopeCondition}
+
+     GROUP BY ib.scope_id, hour_start
+     ORDER BY hour_start`,
+            params
+        );
+
+        // Shared timestamps for all departments.
+        const hours = [...new Set(
+            timeRows.map(row => Number(row.hour_start))
+        )].sort((a, b) => a - b);
+
+        let graphScopes = scopes.map(scope => ({
+            scope_id: String(scope.scope_id),
+            scope_code: scope.scope_code,
+            scope_name: scope.scope_name
+        }));
+
+        graphScopes.push({
+            scope_id: "legacy",
+            scope_code: "LEGACY",
+            scope_name: "Unassigned"
+        });
+
+        if (selectedScope !== "all") {
+            graphScopes = graphScopes.filter(
+                scope => scope.scope_id === selectedScope
             );
+        }
 
-        let cumulative = 0;
+        const departmentTimelines = graphScopes.map(scope => {
+            let cumulative = 0;
 
-        const timeline = timeRows.map(row => {
-            cumulative += Number(row.ballots);
+            const points = hours.map(hour => {
+                const row = timeRows.find(item =>
+                    String(item.scope_id ?? "legacy") ===
+                    scope.scope_id &&
+                    Number(item.hour_start) === hour
+                );
+
+                cumulative += Number(row?.ballots || 0);
+
+                return {
+                    timestamp: hour * 1000,
+                    counted_ballots: cumulative
+                };
+            });
 
             return {
-                timestamp:
-                    Number(row.hour_start) * 1000,
+                ...scope,
+                points
+            };
+        });
 
+        // Overall timeline for compatibility.
+        let cumulative = 0;
+
+        const timeline = hours.map(hour => {
+            cumulative += timeRows
+                .filter(row => Number(row.hour_start) === hour)
+                .reduce(
+                    (sum, row) => sum + Number(row.ballots),
+                    0
+                );
+
+            return {
+                timestamp: hour * 1000,
                 counted_ballots: cumulative
             };
         });
@@ -669,6 +723,7 @@ exports.getAnalytics = async (req, res) => {
             },
 
             timeline,
+            department_timelines: departmentTimelines,
 
             positions: positionRows.map(row => ({
                 position_id: Number(row.position_id),
