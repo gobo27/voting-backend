@@ -1292,7 +1292,7 @@ function markerLightingMask(data, width, height) {
     };
 }
 
-async function findMarkers(image) {
+async function findMarkers(image, paperSize = "A5") {
     const input = image && (
         image.data || image.graydata
     );
@@ -1365,13 +1365,30 @@ async function findMarkers(image) {
             thresholdModel: dynamic.model,
             backgroundCell: dynamic.background_cell_px
         },
-        image
+        image,
+        { paperSize }
     );
 }
 
 /* REGISTRATION SQUARE SHAPE AND GEOMETRY */
 
-const MARKER_EXPECTED_RATIO = 129 / 193;
+
+const MARKER_LAYOUTS = {
+    A5: {
+        left: 8,
+        right: 137,
+        top: 6,
+        bottom: 199
+    },
+
+    A4: {
+        left: 8,
+        right: 199,
+        top: 6,
+        bottom: 287
+    }
+};
+
 const MARKER_MAX_CANDIDATES = 12;
 
 function markerAlignmentError(message, diagnostics) {
@@ -1549,6 +1566,23 @@ function detectMarkerSquares(
     workingImage,
     options = {}
 ) {
+
+    const markerLayout =
+        MARKER_LAYOUTS[options.paperSize || "A5"];
+
+    if (!markerLayout) {
+        throw new Error("Unsupported marker layout.");
+    }
+
+    const markerWidth =
+        markerLayout.right - markerLayout.left;
+
+    const markerHeight =
+        markerLayout.bottom - markerLayout.top;
+
+    const expectedMarkerRatio =
+        markerWidth / markerHeight;
+
     const started = performance.now();
 
     const {
@@ -1912,7 +1946,7 @@ function detectMarkerSquares(
                         ((left + right) / 2);
 
                     const ratioError = Math.abs(
-                        measuredRatio - MARKER_EXPECTED_RATIO
+                        measuredRatio - expectedMarkerRatio
                     );
 
                     const widthError =
@@ -1947,8 +1981,8 @@ function detectMarkerSquares(
 
                     // Physical 3 mm squares with 129 x 193 mm center spacing.
                     const expectedSide = 3 * Math.sqrt(
-                        ((top + bottom) / (2 * 129)) *
-                        ((left + right) / (2 * 193))
+                        ((top + bottom) / (2 * markerWidth)) *
+                        ((left + right) / (2 * markerHeight))
                     );
 
                     if (
@@ -2652,10 +2686,10 @@ exports.uploadAndProcess = async (req, res) => {
             record.template.paper_size || ""
         ).toUpperCase();
 
-        if (paperSize !== "A5") {
+        if (!["A4", "A5"].includes(paperSize)) {
             return fail(
                 422,
-                "Only A5 portrait ballots are supported."
+                "Only A4 and A5 portrait ballots are supported."
             );
         }
 
@@ -2669,14 +2703,17 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
-        const paper = PAPER_DIMENSIONS.A5;
+        const paper = PAPER_DIMENSIONS[paperSize];
         const oldX = Math.round(mm(18));
 
         const savedX = record.coordinates.map(
             coordinate => Number(coordinate.x_pos)
         );
 
-        if (savedX.every(x => x === oldX)) {
+        if (
+            paperSize === "A5" &&
+            savedX.every(x => x === oldX)
+        ) {
             return fail(
                 422,
                 "This template uses the old A5 landscape layout."
@@ -2704,7 +2741,7 @@ exports.uploadAndProcess = async (req, res) => {
              * SHADOW CHANGE:
              * Dynamic marker mask replaces the old fixed threshold.
              */
-            marks = await findMarkers(image);
+            marks = await findMarkers(image, paperSize);
 
             if (
                 !Array.isArray(marks) ||
@@ -2715,11 +2752,26 @@ exports.uploadAndProcess = async (req, res) => {
                 );
             }
 
+
+            const layout = MARKER_LAYOUTS[paperSize];
+
             const markerPoints = [
-                { x: mm(9.5), y: mm(7.5) },
-                { x: mm(138.5), y: mm(7.5) },
-                { x: mm(9.5), y: mm(200.5) },
-                { x: mm(138.5), y: mm(200.5) }
+                {
+                    x: mm(layout.left + 1.5),
+                    y: mm(layout.top + 1.5)
+                },
+                {
+                    x: mm(layout.right + 1.5),
+                    y: mm(layout.top + 1.5)
+                },
+                {
+                    x: mm(layout.left + 1.5),
+                    y: mm(layout.bottom + 1.5)
+                },
+                {
+                    x: mm(layout.right + 1.5),
+                    y: mm(layout.bottom + 1.5)
+                }
             ];
 
             const distance = (a, b) => Math.hypot(

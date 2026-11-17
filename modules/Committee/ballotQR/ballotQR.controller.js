@@ -816,7 +816,7 @@ exports.getPrintSummary = async (req, res) => {
 
             registered_unique: Number(registered[0].count),
 
-            unit: "individual A5 ballots",
+            unit: "individual ballots (A4/A5)",
             note: "Counts are operator-confirmed, not printer-verified."
         });
 

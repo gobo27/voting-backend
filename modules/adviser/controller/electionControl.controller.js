@@ -252,6 +252,7 @@ exports.getStatus = async (req, res) => {
             election: {
                 election_id: election.election_id,
                 title: election.title,
+                school_level: election.school_level,
                 start_time: election.start_time,
                 end_time: election.end_time,
                 status: election.status,
