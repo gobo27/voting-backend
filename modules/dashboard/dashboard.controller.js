@@ -128,7 +128,7 @@ function formatPublicElection(election) {
         mask_names: revealNames ? 0 : 1,
         results_finalized: finalized,
         reveal_names: revealNames,
-        reveal_votes: finalized
+        reveal_votes: true
     };
 }
 
@@ -301,8 +301,7 @@ async function buildOverview(election, adminAccess = false) {
     const revealNames =
         adminAccess || canShowNames(election);
 
-    const revealVotes =
-       adminAccess || canShowVotes(election);
+    const revealVotes = true;
 
     const result = positions.map(position => ({
         position_id: position.position_id,
@@ -333,9 +332,9 @@ async function buildOverview(election, adminAccess = false) {
                 name: revealNames
                     ? candidate.name
                     : `Candidate #${candidate.candidate_id}`,
-                course: candidate.course,
-                grade_level: candidate.grade_level,
-                party_list: candidate.party_list,
+                course: revealNames ? candidate.course : null,
+                grade_level: revealNames ? candidate.grade_level : null,
+                party_list: revealNames ? candidate.party_list : null,
                 display_order: candidate.display_order,
                 total_votes: revealVotes
                     ? Number(candidate.total_votes || 0)
@@ -369,8 +368,8 @@ async function buildOverview(election, adminAccess = false) {
 
         statistics: {
             scanned_ballots: revealVotes
-            ? Number(ballotCount[0]?.total || 0)
-            : null,
+                ? Number(ballotCount[0]?.total || 0)
+                : null,
             total_candidates: candidates.length
         }
 
@@ -454,14 +453,6 @@ exports.getAnalytics = async (req, res) => {
         );
 
         // Public results must remain hidden
-        // until officially released.
-        if (!canShowVotes(election)) {
-            return res.json({
-                school_level: election.school_level,
-                scopes,
-                results_hidden: true
-            });
-        }
 
         const selectedScope = String(
             req.query.scope_id || "all"
