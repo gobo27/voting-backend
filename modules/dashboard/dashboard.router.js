@@ -33,4 +33,10 @@ router.get("/:election_id/admin-overview",verifyToken,verifyToken.requireRole("s
     dashboardController.getAdminOverview
 );
 
+router.get(
+    "/:election_id/analytics",
+    dashboardController.getAnalytics
+);
+
+
 module.exports = router;

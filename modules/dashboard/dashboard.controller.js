@@ -15,6 +15,7 @@ async function resolveElection(electionId) {
             SELECT
                 election_id,
                 title,
+                school_level,
                 start_time,
                 end_time,
                 status,
@@ -33,6 +34,7 @@ async function resolveElection(electionId) {
             SELECT
                 election_id,
                 title,
+                school_level,
                 start_time,
                 end_time,
                 status,
@@ -299,7 +301,8 @@ async function buildOverview(election, adminAccess = false) {
     const revealNames =
         adminAccess || canShowNames(election);
 
-    const revealVotes =true;
+    const revealVotes =
+       adminAccess || canShowVotes(election);
 
     const result = positions.map(position => ({
         position_id: position.position_id,
@@ -365,7 +368,9 @@ async function buildOverview(election, adminAccess = false) {
 
 
         statistics: {
-            scanned_ballots: Number(ballotCount[0]?.total || 0),
+            scanned_ballots: revealVotes
+            ? Number(ballotCount[0]?.total || 0)
+            : null,
             total_candidates: candidates.length
         }
 
@@ -416,6 +421,292 @@ exports.getAdminOverview = async (req, res) => {
             res,
             error,
             "Admin dashboard overview error:"
+        );
+    }
+};
+
+exports.getAnalytics = async (req, res) => {
+    try {
+        const election = await resolveElection(
+            req.params.election_id
+        );
+
+        const electionId = Number(
+            election.election_id
+        );
+
+        const scopeType =
+            election.school_level === "college"
+                ? "department"
+                : "grade";
+
+        const [scopes] = await connection.execute(
+            `SELECT
+                scope_id,
+                scope_code,
+                scope_name,
+                scope_type
+             FROM election_scopes
+             WHERE election_id = ?
+               AND scope_type = ?
+             ORDER BY scope_id`,
+            [electionId, scopeType]
+        );
+
+        // Public results must remain hidden
+        // until officially released.
+        if (!canShowVotes(election)) {
+            return res.json({
+                school_level: election.school_level,
+                scopes,
+                results_hidden: true
+            });
+        }
+
+        const selectedScope = String(
+            req.query.scope_id || "all"
+        );
+
+        if (
+            selectedScope !== "all" &&
+            selectedScope !== "legacy" &&
+            !scopes.some(
+                scope =>
+                    String(scope.scope_id) === selectedScope
+            )
+        ) {
+            return res.status(400).json({
+                message: "Invalid department or grade."
+            });
+        }
+
+        let scopeCondition = "";
+        const params = [electionId];
+
+        if (selectedScope === "legacy") {
+            scopeCondition =
+                "AND ib.scope_id IS NULL";
+        } else if (selectedScope !== "all") {
+            scopeCondition =
+                "AND ib.scope_id = ?";
+
+            params.push(Number(selectedScope));
+        }
+
+        // Registered and counted ballot statistics
+        const [[summary]] =
+            await connection.execute(
+                `SELECT
+                    COUNT(*) AS registered_ballots,
+
+                    COALESCE(SUM(
+                        CASE
+                            WHEN ib.status = 'COUNTED'
+                            THEN 1 ELSE 0
+                        END
+                    ), 0) AS counted_ballots,
+
+                    COALESCE(SUM(
+                        CASE
+                            WHEN ib.scope_id IS NULL
+                            THEN 1 ELSE 0
+                        END
+                    ), 0) AS legacy_ballots
+
+                 FROM issued_ballots ib
+                 WHERE ib.election_id = ?
+                 ${scopeCondition}`,
+                params
+            );
+
+        const registered = Number(
+            summary.registered_ballots || 0
+        );
+
+        const counted = Number(
+            summary.counted_ballots || 0
+        );
+
+        const countingPercentage =
+            registered > 0
+                ? Number(
+                    ((counted / registered) * 100)
+                        .toFixed(2)
+                )
+                : null;
+
+        // Cumulative counting time series
+        const [timeRows] =
+            await connection.execute(
+                `SELECT
+                    FLOOR(
+                        UNIX_TIMESTAMP(ib.counted_at) / 3600
+                    ) * 3600 AS hour_start,
+
+                    COUNT(*) AS ballots
+
+                 FROM issued_ballots ib
+                 WHERE ib.election_id = ?
+                   AND ib.status = 'COUNTED'
+                   AND ib.counted_at IS NOT NULL
+                   ${scopeCondition}
+
+                 GROUP BY hour_start
+                 ORDER BY hour_start`,
+                params
+            );
+
+        let cumulative = 0;
+
+        const timeline = timeRows.map(row => {
+            cumulative += Number(row.ballots);
+
+            return {
+                timestamp:
+                    Number(row.hour_start) * 1000,
+
+                counted_ballots: cumulative
+            };
+        });
+
+        // Count valid recorded selections per ballot
+        // and per applicable position.
+        const [positionRows] =
+            await connection.execute(
+                `SELECT
+                    p.position_id,
+
+                    COUNT(*) AS applicable_ballots,
+
+                    SUM(
+                        CASE
+                            WHEN COALESCE(v.selections, 0) = 0
+                            THEN 1 ELSE 0
+                        END
+                    ) AS no_recorded_vote,
+
+                    SUM(
+                        CASE
+                            WHEN v.selections > 0
+                             AND v.selections <
+                                 COALESCE(p.max_selection, 1)
+                            THEN 1 ELSE 0
+                        END
+                    ) AS partial_selections
+
+                 FROM positions p
+
+                 INNER JOIN issued_ballots ib
+                    ON ib.election_id = p.election_id
+                   AND ib.status = 'COUNTED'
+
+                 LEFT JOIN (
+                    SELECT
+                        bv.ballot_id,
+                        bv.position_id,
+                        COUNT(DISTINCT bv.candidate_id)
+                            AS selections
+                    FROM ballot_votes bv
+                    GROUP BY
+                        bv.ballot_id,
+                        bv.position_id
+                 ) v
+                    ON v.ballot_id = ib.ballot_id
+                   AND v.position_id = p.position_id
+
+                 WHERE ib.election_id = ?
+
+                 ${scopeCondition}
+
+                 AND EXISTS (
+                    SELECT 1
+                    FROM omr_grid_coordinates g
+                    INNER JOIN candidates c
+                        ON c.candidate_id = g.candidate_id
+                    WHERE g.template_id = ib.template_id
+                      AND c.position_id = p.position_id
+                 )
+
+                 GROUP BY p.position_id`,
+                params
+            );
+
+        // Candidate tallies for selected scope
+        const [candidateRows] =
+            await connection.execute(
+                `SELECT
+                    bv.candidate_id,
+                    COUNT(DISTINCT ib.ballot_id)
+                        AS total_votes
+
+                 FROM ballot_votes bv
+                 INNER JOIN issued_ballots ib
+                    ON ib.ballot_id = bv.ballot_id
+
+                 INNER JOIN candidates c
+                    ON c.candidate_id = bv.candidate_id
+                   AND c.position_id = bv.position_id
+                   AND c.election_id = ib.election_id
+
+                 WHERE ib.election_id = ?
+                   AND ib.status = 'COUNTED'
+
+                 ${scopeCondition}
+
+                 GROUP BY bv.candidate_id`,
+                params
+            );
+
+        res.set("Cache-Control", "no-store");
+
+        return res.json({
+            school_level: election.school_level,
+            scopes,
+            selected_scope: selectedScope,
+            results_hidden: false,
+
+            statistics: {
+                registered_ballots: registered,
+                counted_ballots: counted,
+
+                legacy_ballots: Number(
+                    summary.legacy_ballots || 0
+                ),
+
+                counting_percentage:
+                    countingPercentage
+            },
+
+            timeline,
+
+            positions: positionRows.map(row => ({
+                position_id: Number(row.position_id),
+
+                applicable_ballots: Number(
+                    row.applicable_ballots || 0
+                ),
+
+                no_recorded_vote: Number(
+                    row.no_recorded_vote || 0
+                ),
+
+                partial_selections: Number(
+                    row.partial_selections || 0
+                )
+            })),
+
+            candidate_tallies: candidateRows.map(row => ({
+                candidate_id: Number(row.candidate_id),
+
+                total_votes: Number(row.total_votes)
+            }))
+        });
+
+    } catch (error) {
+        return sendError(
+            res,
+            error,
+            "Dashboard analytics error:"
         );
     }
 };
