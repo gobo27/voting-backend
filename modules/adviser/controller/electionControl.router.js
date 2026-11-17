@@ -5,6 +5,7 @@ const router = express.Router();
 
 const electionControl = require("./electionControl.controller");
 const verifyToken = require("../../sheared/middleware");
+const adviserElectionAccess = require("./adviserElectionAccess");
 
 // PUBLIC ENDPOINTS
 
@@ -26,8 +27,10 @@ router.use(
         "super_admin",
         "committee",
         "adviser"
+
     )
 );
+router.use(adviserElectionAccess);
 
 // ELECTION SCHEDULE
 

@@ -7,7 +7,7 @@ const jwt = require("jsonwebtoken");
 // Use the same confirmed EmailJS path as your working controller.
 const {
     sendElectionReportEmail
-} = require("../admin/emailjs.server");
+} = require("../../super admin/adduser/emailjs.server");
 
 const validId = value =>
     Number.isSafeInteger(Number(value)) &&

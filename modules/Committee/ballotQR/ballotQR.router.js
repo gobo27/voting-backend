@@ -49,13 +49,17 @@ router.delete(
     "/templates/:template_id",
     ballotController.deleteTemplate
 );
-
-// QR PRINT BATCHES
-
 router.post(
     "/qr/batches",
+    verifyToken.requireRole("super_admin"),
     qrController.createBatch
 );
+
+router.get(
+    "/qr/scopes/election/:election_id",
+    qrController.getElectionScopes
+);
+
 
 router.get(
     "/qr/batches/election/:election_id",

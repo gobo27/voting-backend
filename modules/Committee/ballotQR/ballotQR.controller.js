@@ -19,17 +19,63 @@ function qrPayload(ballot) {
     ].join("|");
 }
 
+exports.getElectionScopes = async (req, res) => {
+    const electionId = Number(req.params.election_id);
+
+    if (!validId(electionId)) {
+        return res.status(400).json({
+            message: "Invalid election ID."
+        });
+    }
+
+    try {
+        const [rows] = await pool.execute(
+            `SELECT
+                s.scope_id,
+                s.scope_type,
+                s.scope_code,
+                s.scope_name,
+                e.school_level,
+                b.batch_id AS existing_batch_id,
+                b.quantity AS existing_quantity
+             FROM election_scopes s
+             INNER JOIN elections e
+                ON e.election_id = s.election_id
+             LEFT JOIN ballot_print_batches b
+                ON b.election_id = s.election_id
+               AND b.scope_id = s.scope_id
+             WHERE s.election_id = ?
+               AND s.is_active = 1
+             ORDER BY s.scope_id`,
+            [electionId]
+        );
+
+        return res.json({ scopes: rows });
+
+    } catch (error) {
+        console.error("Load scopes error:", error);
+
+        return res.status(500).json({
+            message: "Failed to load election scopes."
+        });
+    }
+};
+
+
 // Same request_id, same registered QR batch.
+
 async function existingBatchResponse(
     db,
     requestId,
     electionId,
     templateId,
     quantity,
-    batchType
+    batchType,
+    scopeId
 ) {
     const [batches] = await db.execute(
-        `SELECT batch_id, election_id, template_id, quantity, batch_type
+        `SELECT batch_id, election_id, template_id,
+                quantity, batch_type, scope_id
          FROM ballot_print_batches
          WHERE request_id = ?
          LIMIT 1`,
@@ -44,13 +90,15 @@ async function existingBatchResponse(
         Number(batch.election_id) !== electionId ||
         Number(batch.template_id) !== templateId ||
         Number(batch.quantity) !== quantity ||
-        batch.batch_type !== batchType
+        batch.batch_type !== batchType ||
+        Number(batch.scope_id) !== scopeId
     ) {
         return { conflict: true };
     }
 
     const [rows] = await db.execute(
-        `SELECT ballot_id, election_id, template_id
+        `SELECT ballot_id, election_id, template_id,
+                scope_id, serial_number
          FROM issued_ballots
          WHERE batch_id = ?
          ORDER BY created_at, ballot_id`,
@@ -58,14 +106,14 @@ async function existingBatchResponse(
     );
 
     if (rows.length !== quantity) {
-        throw new Error(
-            "Registered batch has an unexpected ballot count."
-        );
+        throw new Error("Unexpected registered ballot count.");
     }
 
     const ballots = await Promise.all(
         rows.map(async ballot => ({
             ballot_id: ballot.ballot_id,
+            scope_id: Number(ballot.scope_id),
+            serial_number: ballot.serial_number,
             qr_code: await QRCode.toDataURL(
                 qrPayload(ballot),
                 {
@@ -87,10 +135,13 @@ async function existingBatchResponse(
     };
 }
 
+
 // Generate new batch; protect against duplicate requests.
+
 exports.createBatch = async (req, res) => {
     const electionId = Number(req.body?.election_id);
     const templateId = Number(req.body?.template_id);
+    const scopeId = Number(req.body?.scope_id);
     const quantity = Number(req.body?.quantity);
     const requestId = String(req.body?.request_id || "");
     const batchType = req.body?.batch_type ?? "ORIGINAL";
@@ -101,15 +152,18 @@ exports.createBatch = async (req, res) => {
     if (
         !validId(electionId) ||
         !validId(templateId) ||
+        !validId(scopeId) ||
         !Number.isSafeInteger(quantity) ||
         quantity < 1 ||
         quantity > 500 ||
         !uuidPattern.test(requestId) ||
-        !["ORIGINAL", "ADDITIONAL"].includes(batchType)
+        batchType !== "ORIGINAL"
     ) {
         return res.status(400).json({
             message:
-                "Valid election, template, quantity (1-500), request_id, and batch_type required."
+                "Valid election, template, scope, " +
+                "quantity (1-500) and request ID required. " +
+                "Additional batches are not allowed."
         });
     }
 
@@ -119,13 +173,10 @@ exports.createBatch = async (req, res) => {
     try {
         db = await pool.getConnection();
 
+        // Safe retry: same request ID = same batch.
         const previous = await existingBatchResponse(
-            db,
-            requestId,
-            electionId,
-            templateId,
-            quantity,
-            batchType
+            db, requestId, electionId,
+            templateId, quantity, batchType, scopeId
         );
 
         if (previous) {
@@ -133,103 +184,184 @@ exports.createBatch = async (req, res) => {
                 previous.conflict ? 409 : 200
             ).json(
                 previous.conflict
-                    ? {
-                        message:
-                            "Request ID was used with different batch details."
-                    }
+                    ? { message: "Request ID conflict." }
                     : previous
             );
-        }
-
-        const [templates] = await db.execute(
-            `SELECT template_id
-             FROM ballot_templates
-             WHERE template_id = ?
-               AND election_id = ?
-             LIMIT 1`,
-            [templateId, electionId]
-        );
-
-        if (!templates.length) {
-            return res.status(404).json({
-                message: "Ballot template not found."
-            });
         }
 
         await db.beginTransaction();
         transactionOpen = true;
 
-        let batchResult;
+        // Lock election during generation.
+        const [[election]] = await db.execute(
+            `SELECT election_id, school_level,
+                    status, is_active,
+                    scanning_open, is_current, archived_at
+             FROM elections
+             WHERE election_id = ?
+             FOR UPDATE`,
+            [electionId]
+        );
 
-        try {
-            [batchResult] = await db.execute(
-                `INSERT INTO ballot_print_batches
-                 (election_id, template_id, quantity, request_id, batch_type)
-                 VALUES (?, ?, ?, ?, ?)`,
-                [
-                    electionId,
-                    templateId,
-                    quantity,
-                    requestId,
-                    batchType
-                ]
-            );
-        } catch (error) {
-            if (error.code !== "ER_DUP_ENTRY") {
-                throw error;
-            }
-
+        if (
+            !election ||
+            Number(election.is_current) !== 1 ||
+            election.archived_at !== null ||
+            String(election.status || "").toLowerCase()
+            === "completed" ||
+            Number(election.is_active) === 1 ||
+            Number(election.scanning_open) === 1
+        ) {
             await db.rollback();
             transactionOpen = false;
 
-            const previousAfterRace =
-                await existingBatchResponse(
-                    db,
-                    requestId,
-                    electionId,
-                    templateId,
-                    quantity,
-                    batchType
-                );
-
-            if (!previousAfterRace) {
-                throw error;
-            }
-
-            return res.status(
-                previousAfterRace.conflict ? 409 : 200
-            ).json(
-                previousAfterRace.conflict
-                    ? {
-                        message:
-                            "Request ID was used with different batch details."
-                    }
-                    : previousAfterRace
-            );
+            return res.status(409).json({
+                message:
+                    "Cannot generate ballots while voting " +
+                    "or scanning is active, or for an " +
+                    "old/completed election."
+            });
         }
 
-        const batchId = batchResult.insertId;
+        // Verify saved ballot template.
+        const [[template]] = await db.execute(
+            `SELECT template_id
+             FROM ballot_templates
+             WHERE template_id = ?
+               AND election_id = ?`,
+            [templateId, electionId]
+        );
+
+        if (!template) {
+            await db.rollback();
+            transactionOpen = false;
+
+            return res.status(404).json({
+                message: "Ballot template not found."
+            });
+        }
+
+        // Verify department / grade belongs to election.
+        const [[scope]] = await db.execute(
+            `SELECT scope_id, scope_code, scope_type
+             FROM election_scopes
+             WHERE scope_id = ?
+               AND election_id = ?
+               AND is_active = 1`,
+            [scopeId, electionId]
+        );
+
+        const expectedType =
+            String(election.school_level).toLowerCase()
+                === "college"
+                ? "department"
+                : "grade";
+
+        if (
+            !scope ||
+            scope.scope_type !== expectedType
+        ) {
+            await db.rollback();
+            transactionOpen = false;
+
+            return res.status(400).json({
+                message:
+                    "Invalid department/grade for this election."
+            });
+        }
+
+        // Existing legacy batches must not be changed.
+        const [[legacy]] = await db.execute(
+            `SELECT COUNT(*) AS total
+             FROM ballot_print_batches
+             WHERE election_id = ?
+               AND scope_id IS NULL`,
+            [electionId]
+        );
+
+        if (Number(legacy.total) > 0) {
+            await db.rollback();
+            transactionOpen = false;
+
+            return res.status(409).json({
+                message:
+                    "This election has existing unscoped " +
+                    "ballots. New generation is blocked. " +
+                    "Existing ballots remain unchanged."
+            });
+        }
+
+        // Only one batch per department / grade.
+        const [existing] = await db.execute(
+            `SELECT batch_id
+             FROM ballot_print_batches
+             WHERE election_id = ?
+               AND scope_id = ?
+             LIMIT 1`,
+            [electionId, scopeId]
+        );
+
+        if (existing.length) {
+            await db.rollback();
+            transactionOpen = false;
+
+            return res.status(409).json({
+                message:
+                    "This department/grade already has a " +
+                    "registered ballot batch. Reprint the " +
+                    "existing batch instead.",
+                existing_batch_id:
+                    Number(existing[0].batch_id)
+            });
+        }
+
+        // Register exactly one original batch.
+        const [insert] = await db.execute(
+            `INSERT INTO ballot_print_batches
+                (election_id, template_id, quantity,
+                 request_id, batch_type, scope_id)
+             VALUES (?, ?, ?, ?, 'ORIGINAL', ?)`,
+            [
+                electionId,
+                templateId,
+                quantity,
+                requestId,
+                scopeId
+            ]
+        );
+
+        const batchId = insert.insertId;
         const ballots = [];
 
         for (let i = 0; i < quantity; i++) {
             const ballotId = crypto.randomUUID();
 
+            const serialNumber =
+                `CV-${electionId}-` +
+                `${String(scope.scope_code).toUpperCase()}-` +
+                `${String(i + 1).padStart(5, "0")}`;
+
             await db.execute(
                 `INSERT INTO issued_ballots
-                 (ballot_id, batch_id, election_id, template_id)
-                 VALUES (?, ?, ?, ?)`,
+                    (ballot_id, batch_id, election_id,
+                     template_id, scope_id, serial_number)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
                 [
                     ballotId,
                     batchId,
                     electionId,
-                    templateId
+                    templateId,
+                    scopeId,
+                    serialNumber
                 ]
             );
 
             ballots.push({
                 ballot_id: ballotId,
                 election_id: electionId,
-                template_id: templateId
+                template_id: templateId,
+                scope_id: scopeId,
+                serial_number: serialNumber
             });
         }
 
@@ -239,6 +371,8 @@ exports.createBatch = async (req, res) => {
         const result = await Promise.all(
             ballots.map(async ballot => ({
                 ballot_id: ballot.ballot_id,
+                scope_id: ballot.scope_id,
+                serial_number: ballot.serial_number,
                 qr_code: await QRCode.toDataURL(
                     qrPayload(ballot),
                     {
@@ -252,18 +386,26 @@ exports.createBatch = async (req, res) => {
 
         return res.status(201).json({
             message: "Ballot batch generated.",
-            batch_id: batchId,
+            batch_id: Number(batchId),
             quantity: result.length,
             ballots: result,
             already_created: false,
-            batch_type: batchType
+            batch_type: "ORIGINAL"
         });
 
     } catch (error) {
         if (db && transactionOpen) {
             try {
                 await db.rollback();
-            } catch (_) {}
+            } catch (_) { }
+        }
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(409).json({
+                message:
+                    "A ballot batch already exists for " +
+                    "this scope or request."
+            });
         }
 
         console.error("QR batch error:", error);
@@ -277,6 +419,7 @@ exports.createBatch = async (req, res) => {
     }
 };
 
+
 // Existing batch for reprint. No new IDs.
 exports.getBatch = async (req, res) => {
     const batchId = Number(req.params.batch_id);
@@ -289,13 +432,16 @@ exports.getBatch = async (req, res) => {
 
     try {
         const [rows] = await pool.execute(
-            `SELECT ballot_id,
-                    election_id,
-                    template_id,
-                    status
-             FROM issued_ballots
-             WHERE batch_id = ?
-             ORDER BY created_at, ballot_id`,
+            `SELECT
+                ballot_id,
+                election_id,
+                template_id,
+                scope_id,
+                serial_number,
+                status
+                FROM issued_ballots
+                WHERE batch_id = ?
+                ORDER BY created_at, ballot_id`,
             [batchId]
         );
 
@@ -385,10 +531,9 @@ exports.listBatchesByElection = async (req, res) => {
             LEFT JOIN issued_ballots i
                 ON i.batch_id = b.batch_id
             WHERE b.election_id = ?
-            ${
-                templateId !== null
-                    ? "AND b.template_id = ?"
-                    : ""
+            ${templateId !== null
+                ? "AND b.template_id = ?"
+                : ""
             }
             GROUP BY
                 b.batch_id,
@@ -455,7 +600,7 @@ exports.confirmPrint = async (req, res) => {
     if (
         !validId(batchId) ||
         !validEventId.test(String(event_id || "")) ||
-        print_type !== "ORIGINAL"||
+        !["ORIGINAL", "REPRINT"].includes(print_type) ||
         !Number.isSafeInteger(quantity) ||
         quantity < 1 ||
         quantity > 500
@@ -591,7 +736,7 @@ exports.confirmPrint = async (req, res) => {
         if (db) {
             try {
                 await db.rollback();
-            } catch (_) {}
+            } catch (_) { }
         }
 
         console.error("Confirm print error:", error);

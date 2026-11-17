@@ -3,8 +3,6 @@
 
 const pool = require("../../../config/db");
 
-// Philippine local time stored as MySQL DATETIME.
-// All schedule comparisons use UTC + 08:00.
 const PH_NOW_SQL = "(UTC_TIMESTAMP() + INTERVAL 8 HOUR)";
 
 function validId(value) {
