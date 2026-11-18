@@ -336,11 +336,13 @@ exports.notify = async (req, res) => {
                     [electionId, adviserId]
                 );
             } catch (error) {
-                console.error(
-                    "EMAIL STATUS UNCERTAIN:",
+                console.error("EMAIL STATUS UNCERTAIN:", {
                     adviserId,
-                    error.message
-                );
+                    status: error?.status ?? null,
+                    message: error?.message ?? null,
+                    text: error?.text ?? null
+                });
+
 
                 try {
                     await db.execute(
