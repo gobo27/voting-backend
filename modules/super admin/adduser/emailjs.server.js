@@ -31,12 +31,13 @@ async function sendCredentialsEmail({
     }
 
     const templateParams = {
+        subject: "CampusVote - Account Credentials",
+        is_report: false,
         to_name: firstName,
         to_email: to,
         role: role,
         temporary_password: password
     };
-
     const response = await emailjs.send(
         EMAILJS_SERVICE_ID,
         EMAILJS_TEMPLATE_ID,
@@ -97,6 +98,7 @@ async function sendPasswordResetOtpEmail({ to, otp }) {
 
     return { sent: true };
 }
+
 async function sendElectionReportEmail({
     to,
     adviserName,
@@ -106,14 +108,14 @@ async function sendElectionReportEmail({
 }) {
     const {
         EMAILJS_SERVICE_ID,
-        EMAILJS_CONTACT_TEMPLATE_ID,
+        EMAILJS_TEMPLATE_ID,
         EMAILJS_PUBLIC_KEY,
         EMAILJS_PRIVATE_KEY
     } = process.env;
 
     if (
         !EMAILJS_SERVICE_ID ||
-        !EMAILJS_CONTACT_TEMPLATE_ID ||
+        !EMAILJS_TEMPLATE_ID ||
         !EMAILJS_PUBLIC_KEY ||
         !EMAILJS_PRIVATE_KEY
     ) {
@@ -122,52 +124,23 @@ async function sendElectionReportEmail({
         );
     }
 
-    if (
-        !to ||
-        !adviserName ||
-        !electionTitle ||
-        !reportUrl
-    ) {
+    if (!to || !adviserName || !electionTitle || !reportUrl) {
         throw new Error(
             "Missing election report email information."
         );
     }
 
-    const subject =
-        `Official Election Report - ${electionTitle}`;
-
-    const message = [
-        `Dear ${adviserName},`,
-        "",
-        "Greetings!",
-        "",
-        "The election report is available for review.",
-        "",
-        `Election: ${electionTitle}`,
-        `School Level: ${schoolLevel}`,
-        "",
-        "Download your PDF report using this secure link:",
-        reportUrl,
-        "",
-        "The link expires after 7 days.",
-        "Please do not share this link with others.",
-        "",
-        "Thank you.",
-        "",
-        "CampusVote Administration"
-    ].join("\n");
-
     const response = await emailjs.send(
         EMAILJS_SERVICE_ID,
-        EMAILJS_CONTACT_TEMPLATE_ID,
+        EMAILJS_TEMPLATE_ID,
         {
+            subject: `Official Election Report - ${electionTitle}`,
+            is_report: true,
             to_email: to,
             to_name: adviserName,
-            subject,
-            message,
-            report_url: reportUrl,
             election_title: electionTitle,
-            school_level: schoolLevel
+            school_level: schoolLevel,
+            report_url: reportUrl
         },
         {
             publicKey: EMAILJS_PUBLIC_KEY,
@@ -186,6 +159,7 @@ async function sendElectionReportEmail({
         acceptedByProvider: true
     };
 }
+
 
 module.exports = {
     sendCredentialsEmail,
