@@ -96,14 +96,18 @@ async function existingBatchResponse(
         return { conflict: true };
     }
 
+
     const [rows] = await db.execute(
         `SELECT ballot_id, election_id, template_id,
-                scope_id, serial_number
-         FROM issued_ballots
-         WHERE batch_id = ?
-         ORDER BY created_at, ballot_id`,
+            scope_id, serial_number, ballot_number
+            FROM issued_ballots
+            WHERE batch_id = ?
+            ORDER BY ballot_number ASC,
+            created_at ASC,
+            ballot_id ASC`,
         [batch.batch_id]
     );
+
 
     if (rows.length !== quantity) {
         throw new Error("Unexpected registered ballot count.");
@@ -114,6 +118,7 @@ async function existingBatchResponse(
             ballot_id: ballot.ballot_id,
             scope_id: Number(ballot.scope_id),
             serial_number: ballot.serial_number,
+            ballot_number: ballot.ballot_number,
             qr_code: await QRCode.toDataURL(
                 qrPayload(ballot),
                 {
@@ -315,6 +320,31 @@ exports.createBatch = async (req, res) => {
             });
         }
 
+        // Continuous ballot numbering per election.
+        const [[numbering]] = await db.execute(
+            `SELECT
+        COALESCE(MAX(ballot_number), 0) AS last_number,
+        COUNT(*) - COUNT(ballot_number) AS unnumbered
+     FROM issued_ballots
+     WHERE election_id = ?`,
+            [electionId]
+        );
+
+        // Protect previously registered ballots.
+        if (Number(numbering.unnumbered) > 0) {
+            await db.rollback();
+            transactionOpen = false;
+
+            return res.status(409).json({
+                message:
+                    "This election contains legacy ballot numbers."
+            });
+        }
+
+        const lastBallotNumber =
+            Number(numbering.last_number);
+
+
         // Register exactly one original batch.
         const [insert] = await db.execute(
             `INSERT INTO ballot_print_batches
@@ -333,26 +363,38 @@ exports.createBatch = async (req, res) => {
         const batchId = insert.insertId;
         const ballots = [];
 
+
         for (let i = 0; i < quantity; i++) {
             const ballotId = crypto.randomUUID();
+
+            // Continue numbering across departments and grades.
+            const ballotNumber = lastBallotNumber + i + 1;
 
             const serialNumber =
                 `CV-${electionId}-` +
                 `${String(scope.scope_code).toUpperCase()}-` +
-                `${String(i + 1).padStart(5, "0")}`;
+                `${String(ballotNumber).padStart(5, "0")}`;
 
             await db.execute(
                 `INSERT INTO issued_ballots
-                    (ballot_id, batch_id, election_id,
-                     template_id, scope_id, serial_number)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
+            (
+                ballot_id,
+                batch_id,
+                election_id,
+                template_id,
+                scope_id,
+                serial_number,
+                ballot_number
+            )
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
                 [
                     ballotId,
                     batchId,
                     electionId,
                     templateId,
                     scopeId,
-                    serialNumber
+                    serialNumber,
+                    ballotNumber
                 ]
             );
 
@@ -361,7 +403,8 @@ exports.createBatch = async (req, res) => {
                 election_id: electionId,
                 template_id: templateId,
                 scope_id: scopeId,
-                serial_number: serialNumber
+                serial_number: serialNumber,
+                ballot_number: ballotNumber
             });
         }
 
@@ -373,6 +416,7 @@ exports.createBatch = async (req, res) => {
                 ballot_id: ballot.ballot_id,
                 scope_id: ballot.scope_id,
                 serial_number: ballot.serial_number,
+                ballot_number: ballot.ballot_number,
                 qr_code: await QRCode.toDataURL(
                     qrPayload(ballot),
                     {
@@ -438,10 +482,13 @@ exports.getBatch = async (req, res) => {
                 template_id,
                 scope_id,
                 serial_number,
+                ballot_number,
                 status
                 FROM issued_ballots
                 WHERE batch_id = ?
-                ORDER BY created_at, ballot_id`,
+                 ORDER BY ballot_number ASC,
+                 created_at ASC,
+                 ballot_id ASC`,
             [batchId]
         );
 
