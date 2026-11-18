@@ -510,6 +510,14 @@ exports.notifyReportAdvisers = async (req, res) => {
     const secret = process.env.REPORT_LINK_SECRET;
     const apiBase = process.env.REPORT_PUBLIC_API_BASE;
 
+    console.log("REPORT CONFIG CHECK:", {
+        secretExists: Boolean(secret),
+        secretLength: Buffer.byteLength(secret || "", "utf8"),
+        apiBaseExists: Boolean(apiBase),
+        httpsValid: Boolean(apiBase?.startsWith("https://"))
+    });
+
+
     if (
         !secret ||
         Buffer.byteLength(secret, "utf8") < 32 ||
