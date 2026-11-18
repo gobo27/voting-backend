@@ -34,7 +34,7 @@ async function sendCredentialsEmail({
         subject: "CampusVote - Account Credentials",
         is_report: false,
         to_name: firstName,
-        to_email: to,
+        to_email: String(to || "").trim(),
         role: role,
         temporary_password: password
     };
