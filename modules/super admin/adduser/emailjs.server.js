@@ -34,10 +34,22 @@ async function sendCredentialsEmail({
         subject: "CampusVote - Account Credentials",
         is_report: false,
         to_name: firstName,
-        to_email: String(to || "").trim(),
+        to_email: recipient,
         role: role,
         temporary_password: password
     };
+    const recipient = String(to || "").trim();
+
+    console.log("REPORT EMAIL DEBUG:", {
+        templateId: EMAILJS_TEMPLATE_ID,
+        serviceId: EMAILJS_SERVICE_ID,
+        recipientLength: recipient.length,
+        recipientValid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)
+    });
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+        throw new Error("Invalid Adviser email address.");
+    }
     const response = await emailjs.send(
         EMAILJS_SERVICE_ID,
         EMAILJS_TEMPLATE_ID,
@@ -136,7 +148,7 @@ async function sendElectionReportEmail({
         {
             subject: `Official Election Report - ${electionTitle}`,
             is_report: true,
-            to_email: String(to || "").trim(),
+            to_email: recipient,
             to_name: adviserName,
             election_title: electionTitle,
             school_level: schoolLevel,
