@@ -101,18 +101,45 @@ async function rollback(conn) {
     }
 }
 
-function getReportConfiguration() {
-    const secret = process.env.REPORT_LINK_SECRET;
-    const base = process.env.REPORT_PUBLIC_API_BASE;
 
-    if (
-        !secret ||
-        Buffer.byteLength(secret, "utf8") < 32 ||
-        !base ||
-        !base.startsWith("https://")
-    ) {
+function getReportConfiguration() {
+    const secret = process.env.REPORT_LINK_SECRET || "";
+
+    const base = (
+        process.env.REPORT_PUBLIC_API_BASE || ""
+    ).trim();
+
+    console.log("REPORT CONFIG CHECK:", {
+        secretExists: Boolean(secret),
+        secretLength: Buffer.byteLength(secret, "utf8"),
+        apiBaseExists: Boolean(base),
+        httpsValid: base.startsWith("https://")
+    });
+
+    if (!secret) {
         throw apiError(
-            "Secure report link is not configured.",
+            "REPORT_LINK_SECRET is missing.",
+            503
+        );
+    }
+
+    if (Buffer.byteLength(secret, "utf8") < 32) {
+        throw apiError(
+            "REPORT_LINK_SECRET must be at least 32 bytes.",
+            503
+        );
+    }
+
+    if (!base) {
+        throw apiError(
+            "REPORT_PUBLIC_API_BASE is missing.",
+            503
+        );
+    }
+
+    if (!base.startsWith("https://")) {
+        throw apiError(
+            "REPORT_PUBLIC_API_BASE must start with https://.",
             503
         );
     }
@@ -122,6 +149,7 @@ function getReportConfiguration() {
         base: base.replace(/\/+$/, "")
     };
 }
+
 
 // SEND EMAIL REPORT LINKS
 exports.notify = async (req, res) => {
