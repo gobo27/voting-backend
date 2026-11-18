@@ -30,6 +30,13 @@ async function sendCredentialsEmail({
         throw new Error("Missing account email information.");
     }
 
+
+    const recipient = String(to || "").trim();
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+        throw new Error("Invalid recipient email address.");
+    }
+
     const templateParams = {
         subject: "CampusVote - Account Credentials",
         is_report: false,
@@ -38,18 +45,7 @@ async function sendCredentialsEmail({
         role: role,
         temporary_password: password
     };
-    const recipient = String(to || "").trim();
 
-    console.log("REPORT EMAIL DEBUG:", {
-        templateId: EMAILJS_TEMPLATE_ID,
-        serviceId: EMAILJS_SERVICE_ID,
-        recipientLength: recipient.length,
-        recipientValid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)
-    });
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
-        throw new Error("Invalid Adviser email address.");
-    }
     const response = await emailjs.send(
         EMAILJS_SERVICE_ID,
         EMAILJS_TEMPLATE_ID,
@@ -111,6 +107,7 @@ async function sendPasswordResetOtpEmail({ to, otp }) {
     return { sent: true };
 }
 
+
 async function sendElectionReportEmail({
     to,
     adviserName,
@@ -140,6 +137,19 @@ async function sendElectionReportEmail({
         throw new Error(
             "Missing election report email information."
         );
+    }
+
+    const recipient = String(to || "").trim();
+
+    console.log("REPORT EMAIL DEBUG:", {
+        templateId: EMAILJS_TEMPLATE_ID,
+        serviceId: EMAILJS_SERVICE_ID,
+        recipientLength: recipient.length,
+        recipientValid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)
+    });
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+        throw new Error("Invalid Adviser email address.");
     }
 
     const response = await emailjs.send(
