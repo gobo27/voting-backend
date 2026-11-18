@@ -136,7 +136,7 @@ async function sendElectionReportEmail({
         {
             subject: `Official Election Report - ${electionTitle}`,
             is_report: true,
-            to_email: to,
+            to_email: String(to || "").trim(),
             to_name: adviserName,
             election_title: electionTitle,
             school_level: schoolLevel,
