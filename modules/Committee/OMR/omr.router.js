@@ -178,7 +178,18 @@ router.post(
     },
     omrController.uploadAndProcess
 );
+// MULTI-PAGE COMBINED PREVIEW
 
+router.post(
+    "/validate-pages",
+    express.json({ limit: "1mb" }),
+    omrController.validatePages
+);
+router.post(
+    "/count-pages",
+    express.json({ limit: "1mb" }),
+    omrController.countPages
+);
 // LIVE SCANNING AND COUNTING
 
 router.post(

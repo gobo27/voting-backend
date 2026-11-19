@@ -10,14 +10,164 @@ function validId(value) {
         Number(value) > 0;
 }
 
-function qrPayload(ballot) {
-    return [
-        "CV1",
+
+function multiPageTestEnabled() {
+    return process.env.OMR_MULTIPAGE_QR_TEST === "true" &&
+        process.env.OMR_COUNTING_ENABLED === "false";
+}
+
+function qrPayload(ballot, page = null) {
+    const parts = [
+        page ? "CV2" : "CV1",
         ballot.election_id,
         ballot.ballot_id,
         ballot.template_id
-    ].join("|");
+    ];
+
+    if (page) parts.push(page.page_id);
+
+    return parts.join("|");
 }
+
+function qrImage(payload) {
+    return QRCode.toDataURL(payload, {
+        errorCorrectionLevel: "H",
+        margin: 2,
+        width: 320
+    });
+}
+
+async function loadRegisteredBallots(db, batchId) {
+
+    const [rows] = await db.execute(
+        `SELECT
+            i.ballot_id,
+            i.election_id,
+            i.template_id,
+            i.scope_id,
+            i.serial_number,
+            i.ballot_number,
+            i.status,
+            t.total_pages
+         FROM issued_ballots i
+         JOIN ballot_templates t
+           ON t.template_id = i.template_id
+          AND t.election_id = i.election_id
+         WHERE i.batch_id = ?
+         ORDER BY i.ballot_number,
+                  i.created_at,
+                  i.ballot_id`,
+        [batchId]
+    );
+
+    if (!rows.length) return [];
+
+    const total = Number(rows[0].total_pages);
+
+    if (
+        !Number.isInteger(total) ||
+        total < 1 ||
+        total > 100 ||
+        rows.some(row =>
+            Number(row.total_pages) !== total ||
+            Number(row.template_id) !==
+            Number(rows[0].template_id)
+        )
+    ) {
+        throw new Error(
+            "Invalid registered ballot template."
+        );
+    }
+
+    // Existing single-page QR format.
+    if (total === 1) {
+
+        return Promise.all(
+            rows.map(async row => ({
+                ...row,
+                qr_code: await qrImage(qrPayload(row))
+            }))
+        );
+    }
+
+    if (!multiPageTestEnabled()) {
+        const error = new Error(
+            "Multi-page QR is not yet enabled."
+        );
+
+        error.httpStatus = 409;
+        throw error;
+    }
+
+    if (rows.length * total > 100) {
+        throw new Error("Multi-page test limit exceeded.");
+    }
+
+    // Retrieve existing page IDs.
+    const [pages] = await db.execute(
+        `SELECT
+            p.ballot_id,
+            p.page_id,
+            p.page_number
+         FROM issued_ballot_pages p
+         JOIN issued_ballots i
+           ON i.ballot_id = p.ballot_id
+         WHERE i.batch_id = ?
+         ORDER BY p.page_number`,
+        [batchId]
+    );
+
+    const byBallot = new Map();
+
+    for (const page of pages) {
+
+        if (!byBallot.has(page.ballot_id)) {
+            byBallot.set(page.ballot_id, []);
+        }
+
+        byBallot.get(page.ballot_id).push(page);
+    }
+
+    const ballots = [];
+
+    for (const row of rows) {
+
+        const saved = byBallot.get(row.ballot_id) || [];
+
+        if (
+            saved.length !== total ||
+            saved.some((p, i) =>
+                Number(p.page_number) !== i + 1 ||
+                !p.page_id
+            )
+        ) {
+            throw new Error(
+                "Missing or invalid registered ballot pages."
+            );
+        }
+
+        const qrPages = [];
+
+        for (const page of saved) {
+
+            qrPages.push({
+                page_id: page.page_id,
+                page_number: Number(page.page_number),
+                qr_code: await qrImage(
+                    qrPayload(row, page)
+                )
+            });
+        }
+
+        ballots.push({
+            ...row,
+            pages: qrPages
+        });
+    }
+
+    return ballots;
+}
+
 
 exports.getElectionScopes = async (req, res) => {
     const electionId = Number(req.params.election_id);
@@ -64,6 +214,7 @@ exports.getElectionScopes = async (req, res) => {
 
 // Same request_id, same registered QR batch.
 
+
 async function existingBatchResponse(
     db,
     requestId,
@@ -96,39 +247,16 @@ async function existingBatchResponse(
         return { conflict: true };
     }
 
-
-    const [rows] = await db.execute(
-        `SELECT ballot_id, election_id, template_id,
-            scope_id, serial_number, ballot_number
-            FROM issued_ballots
-            WHERE batch_id = ?
-            ORDER BY ballot_number ASC,
-            created_at ASC,
-            ballot_id ASC`,
-        [batch.batch_id]
+    const ballots = await loadRegisteredBallots(
+        db,
+        batch.batch_id
     );
 
-
-    if (rows.length !== quantity) {
-        throw new Error("Unexpected registered ballot count.");
+    if (ballots.length !== quantity) {
+        throw new Error(
+            "Unexpected registered ballot count."
+        );
     }
-
-    const ballots = await Promise.all(
-        rows.map(async ballot => ({
-            ballot_id: ballot.ballot_id,
-            scope_id: Number(ballot.scope_id),
-            serial_number: ballot.serial_number,
-            ballot_number: ballot.ballot_number,
-            qr_code: await QRCode.toDataURL(
-                qrPayload(ballot),
-                {
-                    errorCorrectionLevel: "H",
-                    margin: 2,
-                    width: 320
-                }
-            )
-        }))
-    );
 
     return {
         message: "Existing QR batch reused.",
@@ -139,7 +267,6 @@ async function existingBatchResponse(
         batch_type: batchType
     };
 }
-
 
 // Generate new batch; protect against duplicate requests.
 
@@ -230,7 +357,7 @@ exports.createBatch = async (req, res) => {
 
         // Verify saved ballot template.
         const [[template]] = await db.execute(
-            `SELECT template_id
+            `SELECT template_id, paper_size, total_pages
              FROM ballot_templates
              WHERE template_id = ?
                AND election_id = ?`,
@@ -244,6 +371,61 @@ exports.createBatch = async (req, res) => {
             return res.status(404).json({
                 message: "Ballot template not found."
             });
+        }
+
+        const totalPages = Number(template.total_pages);
+
+        if (
+            !Number.isInteger(totalPages) ||
+            totalPages < 1 ||
+            totalPages > 100
+        ) {
+            await db.rollback();
+            transactionOpen = false;
+
+            return res.status(409).json({
+                message: "Invalid template page count."
+            });
+        }
+
+        if (totalPages > 1) {
+
+            if (
+                !multiPageTestEnabled() ||
+                template.paper_size !== "A4" ||
+                quantity * totalPages > 100
+            ) {
+                await db.rollback();
+                transactionOpen = false;
+
+                return res.status(409).json({
+                    message:
+                        "Multi-page QR is restricted to " +
+                        "isolated testing (maximum 100 pages per batch)."
+                });
+            }
+
+            const [templatePages] = await db.execute(
+                `SELECT page_number
+         FROM ballot_template_pages
+         WHERE template_id = ?
+         ORDER BY page_number`,
+                [templateId]
+            );
+
+            if (
+                templatePages.length !== totalPages ||
+                templatePages.some((p, i) =>
+                    Number(p.page_number) !== i + 1
+                )
+            ) {
+                await db.rollback();
+                transactionOpen = false;
+
+                return res.status(409).json({
+                    message: "Template pages are incomplete."
+                });
+            }
         }
 
         // Verify department / grade belongs to election.
@@ -361,8 +543,6 @@ exports.createBatch = async (req, res) => {
         );
 
         const batchId = insert.insertId;
-        const ballots = [];
-
 
         for (let i = 0; i < quantity; i++) {
             const ballotId = crypto.randomUUID();
@@ -398,35 +578,47 @@ exports.createBatch = async (req, res) => {
                 ]
             );
 
-            ballots.push({
-                ballot_id: ballotId,
-                election_id: electionId,
-                template_id: templateId,
-                scope_id: scopeId,
-                serial_number: serialNumber,
-                ballot_number: ballotNumber
-            });
+            if (totalPages > 1) {
+
+                for (
+                    let page = 1;
+                    page <= totalPages;
+                    page++
+                ) {
+
+                    await db.execute(
+                        `INSERT INTO issued_ballot_pages
+             (
+                page_id,
+                ballot_id,
+                page_number,
+                status
+             )
+             VALUES (?, ?, ?, 'PENDING')`,
+                        [
+                            crypto.randomUUID(),
+                            ballotId,
+                            page
+                        ]
+                    );
+                }
+            }
+
         }
 
         await db.commit();
         transactionOpen = false;
 
-        const result = await Promise.all(
-            ballots.map(async ballot => ({
-                ballot_id: ballot.ballot_id,
-                scope_id: ballot.scope_id,
-                serial_number: ballot.serial_number,
-                ballot_number: ballot.ballot_number,
-                qr_code: await QRCode.toDataURL(
-                    qrPayload(ballot),
-                    {
-                        errorCorrectionLevel: "H",
-                        margin: 2,
-                        width: 320
-                    }
-                )
-            }))
+        const result = await loadRegisteredBallots(
+            db,
+            batchId
         );
+
+        if (result.length !== quantity) {
+            throw new Error(
+                "Unexpected registered ballot count."
+            );
+        }
 
         return res.status(201).json({
             message: "Ballot batch generated.",
@@ -451,7 +643,11 @@ exports.createBatch = async (req, res) => {
                     "this scope or request."
             });
         }
-
+        if (error.httpStatus === 409) {
+            return res.status(409).json({
+                message: error.message
+            });
+        }
         console.error("QR batch error:", error);
 
         return res.status(500).json({
@@ -463,8 +659,8 @@ exports.createBatch = async (req, res) => {
     }
 };
 
-
 // Existing batch for reprint. No new IDs.
+
 exports.getBatch = async (req, res) => {
     const batchId = Number(req.params.batch_id);
 
@@ -475,42 +671,16 @@ exports.getBatch = async (req, res) => {
     }
 
     try {
-        const [rows] = await pool.execute(
-            `SELECT
-                ballot_id,
-                election_id,
-                template_id,
-                scope_id,
-                serial_number,
-                ballot_number,
-                status
-                FROM issued_ballots
-                WHERE batch_id = ?
-                 ORDER BY ballot_number ASC,
-                 created_at ASC,
-                 ballot_id ASC`,
-            [batchId]
+        const ballots = await loadRegisteredBallots(
+            pool,
+            batchId
         );
 
-        if (!rows.length) {
+        if (!ballots.length) {
             return res.status(404).json({
                 message: "Batch not found."
             });
         }
-
-        const ballots = await Promise.all(
-            rows.map(async row => ({
-                ...row,
-                qr_code: await QRCode.toDataURL(
-                    qrPayload(row),
-                    {
-                        errorCorrectionLevel: "H",
-                        margin: 2,
-                        width: 320
-                    }
-                )
-            }))
-        );
 
         return res.json({
             batch_id: batchId,
@@ -521,8 +691,10 @@ exports.getBatch = async (req, res) => {
     } catch (error) {
         console.error("Get batch error:", error);
 
-        return res.status(500).json({
-            message: "Failed to load batch."
+        return res.status(error.httpStatus || 500).json({
+            message: error.httpStatus
+                ? error.message
+                : "Failed to load batch."
         });
     }
 };

@@ -28,18 +28,25 @@ function validId(value) {
     return Number.isSafeInteger(number) && number > 0;
 }
 
+
 function parseQR(qrData) {
-    const parts = String(qrData || "").trim().split("|");
+    const parts = String(qrData || "")
+        .trim()
+        .split("|");
 
     const uuidPattern =
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+    const version = parts[0];
+    const multi = version === "CV2";
+
     if (
-        parts.length !== 4 ||
-        parts[0] !== "CV1" ||
+        !["CV1", "CV2"].includes(version) ||
+        parts.length !== (multi ? 5 : 4) ||
         !validId(parts[1]) ||
         !uuidPattern.test(parts[2]) ||
-        !validId(parts[3])
+        !validId(parts[3]) ||
+        (multi && !uuidPattern.test(parts[4]))
     ) {
         throw new Error(
             "Invalid CampusVote ballot QR code."
@@ -47,9 +54,13 @@ function parseQR(qrData) {
     }
 
     return {
+        version,
         election_id: Number(parts[1]),
         ballot_id: parts[2].toLowerCase(),
-        template_id: Number(parts[3])
+        template_id: Number(parts[3]),
+        page_id: multi
+            ? parts[4].toLowerCase()
+            : null
     };
 }
 
@@ -2061,17 +2072,21 @@ function detectMarkerSquares(
 
 /* TEMPLATE DATABASE LOOKUP */
 
+
 async function getTemplateCoordinates(
     db,
     templateId,
-    electionId
+    electionId,
+    pageNumber = 1,
+    lock = false
 ) {
     const [templates] = await db.execute(
-        `SELECT template_id, election_id, paper_size
+        `SELECT template_id, election_id,
+                paper_size, total_pages
          FROM ballot_templates
          WHERE template_id = ?
            AND election_id = ?
-         LIMIT 1`,
+         LIMIT 1 ${lock ? "FOR UPDATE" : ""}`,
         [templateId, electionId]
     );
 
@@ -2082,6 +2097,7 @@ async function getTemplateCoordinates(
             g.coord_id,
             g.candidate_id,
             g.bubble_code,
+            g.page_number,
             g.x_pos,
             g.y_pos,
             g.width,
@@ -2096,13 +2112,20 @@ async function getTemplateCoordinates(
          JOIN positions p
            ON p.position_id = c.position_id
          WHERE g.template_id = ?
+           AND g.page_number = ?
            AND c.election_id = ?
            AND p.election_id = ?
          ORDER BY
             p.position_id,
             g.y_pos,
-            g.x_pos`,
-        [templateId, electionId, electionId]
+            g.x_pos
+         ${lock ? "FOR UPDATE" : ""}`,
+        [
+            templateId,
+            pageNumber,
+            electionId,
+            electionId
+        ]
     );
 
     return {
@@ -2110,6 +2133,7 @@ async function getTemplateCoordinates(
         coordinates
     };
 }
+
 
 /* HOMOGRAPHY */
 
@@ -2262,6 +2286,153 @@ function validatePositionVotes(grouped) {
     return { positions, votes };
 }
 
+function multiPageCountingEnabled() {
+    return process.env.OMR_MULTIPAGE_QR_TEST === "true" &&
+        process.env.OMR_MULTIPAGE_COUNT_TEST === "true" &&
+        process.env.OMR_COUNTING_ENABLED === "true";
+}
+
+function multiPagePreviewEnabled() {
+    return process.env.OMR_MULTIPAGE_QR_TEST === "true" &&
+        (
+            process.env.OMR_COUNTING_ENABLED === "false" ||
+            multiPageCountingEnabled()
+        );
+}
+
+function pageCoordinatesHash(coordinates) {
+    const rows = coordinates.map(c => [
+        Number(c.coord_id),
+        Number(c.candidate_id),
+        Number(c.position_id),
+        Number(c.max_selection),
+        Number(c.page_number),
+        c.bubble_code,
+        Number(c.x_pos),
+        Number(c.y_pos),
+        Number(c.width),
+        Number(c.height),
+        c.candidate_name,
+        c.position_name
+    ]).sort((a, b) => a[0] - b[0]);
+
+    return crypto.createHash("sha256")
+        .update(JSON.stringify(rows))
+        .digest("hex");
+}
+
+function pageReviewSecret() {
+    return crypto
+        .createHmac("sha256", process.env.JWT_SECRET)
+        .update("campusvote-page-review-v1")
+        .digest();
+}
+
+function combineVerifiedPages(pages, totalPages) {
+    if (
+        !Number.isInteger(totalPages) ||
+        totalPages < 2 ||
+        totalPages > 100 ||
+        !Array.isArray(pages) ||
+        pages.length !== totalPages
+    ) {
+        throw new Error("All ballot pages are required.");
+    }
+
+    const grouped = new Map();
+    const pageNumbers = new Set();
+    const pageIds = new Set();
+    const candidateIds = new Set();
+
+    const first = pages[0];
+
+    for (const page of pages) {
+        const number = Number(page.page_number);
+
+        if (
+            page.ballot_id !== first.ballot_id ||
+            page.election_id !== first.election_id ||
+            page.template_id !== first.template_id ||
+            page.user_id !== first.user_id ||
+            page.scope_id !== first.scope_id ||
+            Number(page.total_pages) !== totalPages ||
+            !Number.isInteger(number) ||
+            number < 1 ||
+            number > totalPages ||
+            pageNumbers.has(number) ||
+            !page.page_id ||
+            pageIds.has(page.page_id) ||
+            !Array.isArray(page.page_positions) ||
+            !page.page_positions.length
+        ) {
+            throw new Error(
+                "Invalid or duplicate ballot page."
+            );
+        }
+
+        pageNumbers.add(number);
+        pageIds.add(page.page_id);
+
+        for (const position of page.page_positions) {
+            const id = Number(position.position_id);
+            const max = Number(position.max_selection);
+
+            if (
+                !validId(id) || !validId(max) ||
+                !Array.isArray(position.candidates) ||
+                !position.candidates.length
+            ) {
+                throw new Error("Invalid page position.");
+            }
+
+            if (!grouped.has(id)) {
+                grouped.set(id, {
+                    position_id: id,
+                    position_name: position.position_name,
+                    max_selection: max,
+                    candidates: []
+                });
+            }
+
+            const target = grouped.get(id);
+
+            if (
+                target.max_selection !== max ||
+                target.position_name !== position.position_name
+            ) {
+                throw new Error(
+                    "Position rules do not match."
+                );
+            }
+
+            for (const candidate of position.candidates) {
+                const candidateId =
+                    Number(candidate.candidate_id);
+
+                if (
+                    !validId(candidateId) ||
+                    candidateIds.has(candidateId) ||
+                    typeof candidate.filled !== "boolean" ||
+                    candidate.unclear !== false
+                ) {
+                    throw new Error(
+                        "Duplicate candidate or unclear shading."
+                    );
+                }
+
+                candidateIds.add(candidateId);
+
+                target.candidates.push({
+                    ...candidate,
+                    candidate_id: candidateId
+                });
+            }
+        }
+    }
+
+    return validatePositionVotes(grouped);
+}
+
 async function analyzeBubbleCoordinates(
     image,
     H,
@@ -2383,19 +2554,36 @@ async function analyzeBubbleCoordinates(
 
 /* QR VERIFICATION */
 
+
 exports.verifyQR = async (req, res) => {
     try {
         const qr = parseQR(req.body?.qr_data);
 
         const [rows] = await pool.execute(
-            `SELECT ballot_id, election_id, template_id,
-                    batch_id, scope_id, serial_number, status
-             FROM issued_ballots
-             WHERE ballot_id = ?
-               AND election_id = ?
-               AND template_id = ?
+            `SELECT
+                i.ballot_id,
+                i.election_id,
+                i.template_id,
+                i.batch_id,
+                i.scope_id,
+                i.serial_number,
+                i.ballot_number,
+                i.status,
+                t.total_pages,
+                t.paper_size
+             FROM issued_ballots i
+             JOIN ballot_templates t
+               ON t.template_id = i.template_id
+              AND t.election_id = i.election_id
+             WHERE i.ballot_id = ?
+               AND i.election_id = ?
+               AND i.template_id = ?
              LIMIT 1`,
-            [qr.ballot_id, qr.election_id, qr.template_id]
+            [
+                qr.ballot_id,
+                qr.election_id,
+                qr.template_id
+            ]
         );
 
         if (!rows.length) {
@@ -2413,12 +2601,88 @@ exports.verifyQR = async (req, res) => {
             ballot
         );
 
+        const totalPages = Number(ballot.total_pages);
+
+        // Validate QR version against template.
+
+        if (
+            !Number.isInteger(totalPages) ||
+            totalPages < 1 ||
+            totalPages > 100 ||
+            (qr.version === "CV1" && totalPages !== 1) ||
+            (
+                qr.version === "CV2" &&
+                (
+                    totalPages < 2 ||
+                    ballot.paper_size !== "A4"
+                )
+            )
+        ) {
+            return res.status(422).json({
+                valid: false,
+                message:
+                    "QR version does not match the ballot template."
+            });
+        }
+
+        let page = null;
+
+        // CV2 PAGE VERIFICATION
+
+        if (qr.version === "CV2") {
+            if (!multiPagePreviewEnabled()) {
+
+                return res.status(409).json({
+                    valid: false,
+                    message:
+                        "Multi-page QR verification is not enabled."
+                });
+            }
+
+            const [pages] = await pool.execute(
+                `SELECT
+                    p.page_id,
+                    p.page_number,
+                    p.status
+                 FROM issued_ballot_pages p
+                 JOIN ballot_template_pages t
+                   ON t.template_id = ?
+                  AND t.page_number = p.page_number
+                 WHERE p.page_id = ?
+                   AND p.ballot_id = ?
+                 LIMIT 1`,
+                [
+                    qr.template_id,
+                    qr.page_id,
+                    qr.ballot_id
+                ]
+            );
+
+            page = pages[0];
+
+            if (
+                !page ||
+                !Number.isInteger(Number(page.page_number)) ||
+                Number(page.page_number) < 1 ||
+                Number(page.page_number) > totalPages
+            ) {
+                return res.status(422).json({
+                    valid: false,
+                    message:
+                        "Unregistered page or page belongs to another ballot."
+                });
+            }
+        }
+
+        // Existing ballot status protection.
+
         if (ballot.status === "COUNTED") {
             return res.status(409).json({
                 valid: false,
                 duplicate: true,
                 status: "COUNTED",
-                message: "Duplicate ballot. Already counted."
+                message:
+                    "Duplicate ballot. Already counted."
             });
         }
 
@@ -2426,7 +2690,8 @@ exports.verifyQR = async (req, res) => {
             return res.status(409).json({
                 valid: false,
                 status: "VOID",
-                message: "This ballot has been voided."
+                message:
+                    "This ballot has been voided."
             });
         }
 
@@ -2434,7 +2699,16 @@ exports.verifyQR = async (req, res) => {
             return res.status(409).json({
                 valid: false,
                 status: ballot.status,
-                message: "Ballot is not eligible for scanning."
+                message:
+                    "Ballot is not eligible for scanning."
+            });
+        }
+
+        if (page && page.status !== "PENDING") {
+            return res.status(409).json({
+                valid: false,
+                message:
+                    "Page is not eligible for verification."
             });
         }
 
@@ -2442,12 +2716,28 @@ exports.verifyQR = async (req, res) => {
             valid: true,
             duplicate: false,
             status: ballot.status,
+
+            qr_version: qr.version,
+
             ballot_id: ballot.ballot_id,
             election_id: ballot.election_id,
             template_id: ballot.template_id,
             scope_id: ballot.scope_id,
+
             serial_number: ballot.serial_number,
-            message: "Valid ballot. Ready for OMR analysis."
+            ballot_number: ballot.ballot_number,
+
+            total_pages: totalPages,
+            page_id: page?.page_id ?? null,
+            page_number: page
+                ? Number(page.page_number)
+                : 1,
+
+            page_status: page?.status ?? null,
+
+            message: page
+                ? "Registered page verified. No votes saved."
+                : "Valid ballot. Ready for OMR analysis."
         });
 
     } catch (error) {
@@ -2627,6 +2917,22 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
+        const multiPage = qr.version === "CV2";
+
+        if (
+            multiPage &&
+            (
+                !preview ||
+                counting ||
+                !multiPagePreviewEnabled()
+            )
+        ) {
+            return fail(
+                409,
+                "Multi-page preview is disabled. No votes saved."
+            );
+        }
+
         db = await pool.getConnection();
 
 
@@ -2669,10 +2975,45 @@ exports.uploadAndProcess = async (req, res) => {
             );
         }
 
+
+        let pageNumber = 1;
+
+        if (multiPage) {
+            const [pages] = await db.execute(
+                `SELECT p.page_number, p.status
+         FROM issued_ballot_pages p
+         JOIN ballot_template_pages t
+           ON t.template_id = ?
+          AND t.page_number = p.page_number
+         WHERE p.page_id = ?
+           AND p.ballot_id = ?
+         LIMIT 1`,
+                [
+                    templateId,
+                    qr.page_id,
+                    qr.ballot_id
+                ]
+            );
+
+            if (
+                !pages.length ||
+                pages[0].status !== "PENDING" ||
+                !validId(pages[0].page_number)
+            ) {
+                return fail(
+                    422,
+                    "Invalid or unavailable ballot page."
+                );
+            }
+
+            pageNumber = Number(pages[0].page_number);
+        }
+
         const record = await getTemplateCoordinates(
             db,
             templateId,
-            electionId
+            electionId,
+            pageNumber
         );
 
         if (!record) {
@@ -2681,6 +3022,31 @@ exports.uploadAndProcess = async (req, res) => {
                 "Ballot template not found."
             );
         }
+
+        const totalPages = Number(
+            record.template.total_pages
+        );
+
+        if (
+            !Number.isInteger(totalPages) ||
+            totalPages < 1 ||
+            totalPages > 100 ||
+            (!multiPage && totalPages !== 1) ||
+            (
+                multiPage &&
+                (
+                    totalPages < 2 ||
+                    pageNumber > totalPages ||
+                    record.template.paper_size !== "A4"
+                )
+            )
+        ) {
+            return fail(
+                422,
+                "QR does not match the ballot template pages."
+            );
+        }
+
 
         const paperSize = String(
             record.template.paper_size || ""
@@ -2812,7 +3178,7 @@ exports.uploadAndProcess = async (req, res) => {
                 ALIGNMENT_LIMITS.heightError
             ) {
                 throw new Error(
-                    "Registration markers do not match one A5 portrait ballot."
+                    `Registration markers do not match one ${paperSize} portrait ballot.`
                 );
             }
 
@@ -2935,6 +3301,69 @@ exports.uploadAndProcess = async (req, res) => {
         markTime("preview_diagnostic_ms");
 
         const { positions, votes } = analysis;
+
+        if (multiPage) {
+            const unclear = positions.some(
+                position => position.unclear
+            );
+
+            const pagePositions = positions.map(position => ({
+                position_id: position.position_id,
+                position_name: position.position_name,
+                max_selection: position.max_selection,
+                candidates: position.candidates
+            }));
+
+            const pageReviewToken = unclear
+                ? null
+                : jwt.sign(
+                    {
+                        purpose: "omr-page-review",
+                        user_id: Number(req.user.id),
+                        election_id: electionId,
+                        template_id: templateId,
+                        ballot_id: qr.ballot_id,
+                        scope_id: ballots[0].scope_id,
+                        page_id: qr.page_id,
+                        page_number: pageNumber,
+                        total_pages: totalPages,
+                        page_positions: pagePositions,
+                        coordinates_hash: pageCoordinatesHash(record.coordinates)
+                    },
+                    pageReviewSecret(),
+                    {
+                        algorithm: "HS256",
+                        audience: "campusvote-omr-page",
+                        expiresIn: "15m"
+                    }
+                );
+
+            return res.status(unclear ? 422 : 200).json({
+                success: !unclear,
+                valid: !unclear,
+                preview_only: true,
+                counted: false,
+                can_confirm: false,
+                review_token: null,
+                saved_votes: 0,
+                review_required: unclear,
+                qr_version: "CV2",
+                election_id: electionId,
+                template_id: templateId,
+                ballot_id: qr.ballot_id,
+                page_id: qr.page_id,
+                page_number: pageNumber,
+                total_pages: totalPages,
+                page_positions: pagePositions,
+                page_review_token: pageReviewToken,
+                message: unclear
+                    ? "Unclear shading. Retake this page."
+                    : "Page analyzed. No votes saved.",
+
+                ...processingDetails()
+            });
+        }
+
 
 
         const needsReview = positions.filter(
@@ -3081,8 +3510,6 @@ exports.uploadAndProcess = async (req, res) => {
 
 
         if (counting) {
-            db = await pool.getConnection();
-
             await db.beginTransaction();
             transactionStarted = true;
 
@@ -3418,6 +3845,506 @@ exports.uploadAndProcess = async (req, res) => {
         }
     }
 };
+
+
+async function processCollectedPages(
+    req, res, counting = false
+) {
+    res.set("Cache-Control", "no-store");
+
+    const fail = (code, message, extra = {}) =>
+        res.status(code).json({
+            success: false,
+            counted: false,
+            saved_votes: 0,
+            message,
+            ...extra
+        });
+
+    if (
+        !multiPagePreviewEnabled() ||
+        (counting && !multiPageCountingEnabled())
+    ) {
+        return fail(403, "Multi-page operation is disabled.");
+    }
+
+    const tokens = req.body?.page_review_tokens;
+
+    if (
+        !validId(req.user?.id) ||
+        !Array.isArray(tokens) ||
+        tokens.length < 2 ||
+        tokens.length > 100 ||
+        tokens.some(t =>
+            typeof t !== "string" ||
+            !t.length ||
+            t.length > 65536
+        )
+    ) {
+        return fail(400, "All page review tokens are required.");
+    }
+
+    let pages, combined, reviewsHash;
+
+    try {
+        pages = tokens.map(token =>
+            jwt.verify(token, pageReviewSecret(), {
+                algorithms: ["HS256"],
+                audience: "campusvote-omr-page",
+                maxAge: "15m"
+            })
+        );
+
+        if (pages.some(p =>
+            p.purpose !== "omr-page-review" ||
+            p.user_id !== Number(req.user.id) ||
+            !Number.isInteger(p.exp) ||
+            !/^[a-f0-9]{64}$/.test(p.coordinates_hash || "")
+        )) {
+            return fail(
+                403,
+                "Invalid page review. Scan all pages again."
+            );
+        }
+
+        pages.sort((a, b) =>
+            a.page_number - b.page_number
+        );
+
+        combined = combineVerifiedPages(
+            pages,
+            Number(pages[0].total_pages)
+        );
+
+        reviewsHash = crypto.createHash("sha256")
+            .update(JSON.stringify([...tokens].sort()))
+            .digest("hex");
+
+        if (counting) {
+            const confirmation = jwt.verify(
+                req.body?.confirmation_token,
+                pageReviewSecret(),
+                {
+                    algorithms: ["HS256"],
+                    audience: "campusvote-omr-combined",
+                    maxAge: "5m"
+                }
+            );
+
+            if (
+                confirmation.purpose !== "omr-combined-review" ||
+                confirmation.user_id !== Number(req.user.id) ||
+                confirmation.ballot_id !== pages[0].ballot_id ||
+                confirmation.reviews_hash !== reviewsHash ||
+                !Number.isInteger(confirmation.exp)
+            ) {
+                throw new Error("Review mismatch.");
+            }
+        }
+
+    } catch (_) {
+        return fail(
+            422,
+            "Invalid, expired or incomplete reviews. Validate again."
+        );
+    }
+
+    const first = pages[0];
+
+    const blank = combined.positions.every(
+        p => p.result === "BLANK"
+    );
+
+    const eligible =
+        blank || combined.votes.length > 0;
+
+    let db;
+    let transactionStarted = false;
+    let commitAttempted = false;
+
+    try {
+        db = await pool.getConnection();
+
+        if (counting) {
+            await db.beginTransaction();
+            transactionStarted = true;
+        }
+
+        const lock = counting ? "FOR UPDATE" : "";
+
+        const [[election]] = await db.execute(
+            `SELECT status, scanning_open,
+                    scanning_closed_at,
+                    is_current, archived_at
+             FROM elections
+             WHERE election_id = ?
+             LIMIT 1 ${lock}`,
+            [first.election_id]
+        );
+
+        const current =
+            election &&
+            Number(election.is_current) === 1 &&
+            !election.archived_at;
+
+        const scanningAllowed =
+            current &&
+            Number(election.scanning_open) === 1 &&
+            !election.scanning_closed_at &&
+            ["active", "completed"].includes(
+                String(election.status).toLowerCase()
+            );
+
+        if (!current || (counting && !scanningAllowed)) {
+            return fail(
+                403,
+                "Election scanning is unavailable."
+            );
+        }
+
+        const [[ballot]] = await db.execute(
+            `SELECT i.ballot_id, i.election_id,
+                    i.template_id, i.scope_id,
+                    i.batch_id, i.status,
+                    t.total_pages, t.paper_size
+             FROM issued_ballots i
+             JOIN ballot_templates t
+               ON t.template_id = i.template_id
+              AND t.election_id = i.election_id
+             WHERE i.ballot_id = ?
+               AND i.election_id = ?
+               AND i.template_id = ?
+             LIMIT 1 ${lock}`,
+            [
+                first.ballot_id,
+                first.election_id,
+                first.template_id
+            ]
+        );
+
+        if (!ballot) {
+            return fail(404, "Unregistered ballot.");
+        }
+
+        await assertBallotScopeAccess(
+            db, req.user, ballot, counting
+        );
+
+        if (ballot.status === "COUNTED") {
+            return fail(
+                409,
+                "Ballot already counted.",
+                {
+                    duplicate: true,
+                    status: "COUNTED"
+                }
+            );
+        }
+
+        if (
+            !["ISSUED", "CAST"].includes(ballot.status) ||
+            ballot.scope_id !== first.scope_id ||
+            Number(ballot.total_pages) !== pages.length ||
+            ballot.paper_size !== "A4"
+        ) {
+            return fail(
+                409,
+                "Ballot is no longer available."
+            );
+        }
+
+        const [registered] = await db.execute(
+            `SELECT p.page_id, p.page_number, p.status
+             FROM issued_ballot_pages p
+             JOIN ballot_template_pages t
+               ON t.template_id = ?
+              AND t.page_number = p.page_number
+             WHERE p.ballot_id = ?
+             ORDER BY p.page_number ${lock}`,
+            [
+                first.template_id,
+                first.ballot_id
+            ]
+        );
+
+        if (
+            registered.length !== pages.length ||
+            pages.some(page => !registered.some(row =>
+                row.page_id === page.page_id &&
+                Number(row.page_number) ===
+                Number(page.page_number) &&
+                row.status === "PENDING"
+            ))
+        ) {
+            return fail(
+                409,
+                "Registered pages do not match."
+            );
+        }
+
+        for (const page of pages) {
+            const record = await getTemplateCoordinates(
+                db,
+                first.template_id,
+                first.election_id,
+                Number(page.page_number),
+                counting
+            );
+
+            const detected = page.page_positions.flatMap(pos =>
+                pos.candidates.map(c => ({
+                    id: Number(c.candidate_id),
+                    position: Number(pos.position_id),
+                    max: Number(pos.max_selection),
+                    name: c.name,
+                    title: pos.position_name
+                }))
+            );
+
+            if (
+                !record ||
+                pageCoordinatesHash(record.coordinates) !==
+                page.coordinates_hash ||
+                record.coordinates.length !== detected.length ||
+                detected.some(d => !record.coordinates.some(c =>
+                    d.id === Number(c.candidate_id) &&
+                    d.position === Number(c.position_id) &&
+                    d.max === Number(c.max_selection) &&
+                    d.name === c.candidate_name &&
+                    d.title === c.position_name
+                ))
+            ) {
+                return fail(
+                    409,
+                    "Template changed. Scan all pages again."
+                );
+            }
+        }
+
+        // FINAL DATABASE COUNTING
+
+        if (counting) {
+            if (!eligible) {
+                return fail(
+                    422,
+                    "No valid votes detected."
+                );
+            }
+
+            if (pages.some(p =>
+                p.exp <= Math.floor(Date.now() / 1000)
+            )) {
+                return fail(
+                    422,
+                    "Page reviews expired. Scan all pages again."
+                );
+            }
+
+            const [existing] = await db.execute(
+                `SELECT vote_id
+                 FROM ballot_votes
+                 WHERE ballot_id = ?
+                 LIMIT 1 FOR UPDATE`,
+                [first.ballot_id]
+            );
+
+            if (existing.length) {
+                return fail(
+                    409,
+                    "Existing vote records require reconciliation."
+                );
+            }
+
+            for (const vote of combined.votes) {
+                if (
+                    !Number.isFinite(vote.fill_intensity) ||
+                    vote.fill_intensity < 0 ||
+                    vote.fill_intensity > 100
+                ) {
+                    return fail(
+                        422,
+                        "Invalid bubble measurement."
+                    );
+                }
+            }
+
+            if (combined.votes.length) {
+                const placeholders = combined.votes
+                    .map(() => "(?, ?, ?, ?)")
+                    .join(",");
+
+                const [inserted] = await db.execute(
+                    `INSERT INTO ballot_votes
+                     (
+                         ballot_id,
+                         candidate_id,
+                         position_id,
+                         fill_intensity
+                     )
+                     VALUES ${placeholders}`,
+                    combined.votes.flatMap(v => [
+                        first.ballot_id,
+                        v.candidate_id,
+                        v.position_id,
+                        v.fill_intensity
+                    ])
+                );
+
+                if (
+                    inserted.affectedRows !==
+                    combined.votes.length
+                ) {
+                    throw new Error("Vote insert mismatch.");
+                }
+            }
+
+            const [updatedPages] = await db.execute(
+                `UPDATE issued_ballot_pages
+                 SET status = 'COUNTED'
+                 WHERE ballot_id = ?
+                   AND status = 'PENDING'`,
+                [first.ballot_id]
+            );
+
+            if (
+                updatedPages.affectedRows !== pages.length
+            ) {
+                throw new Error("Page status update mismatch.");
+            }
+
+            const [updatedBallot] = await db.execute(
+                `UPDATE issued_ballots
+                 SET status = 'COUNTED',
+                     counted_at = CURRENT_TIMESTAMP,
+                     cast_at = COALESCE(
+                         cast_at,
+                         CURRENT_TIMESTAMP
+                     )
+                 WHERE ballot_id = ?
+                   AND election_id = ?
+                   AND template_id = ?
+                   AND status IN ('ISSUED', 'CAST')`,
+                [
+                    first.ballot_id,
+                    first.election_id,
+                    first.template_id
+                ]
+            );
+
+            if (updatedBallot.affectedRows !== 1) {
+                throw new Error("Ballot status update mismatch.");
+            }
+
+            commitAttempted = true;
+            await db.commit();
+            transactionStarted = false;
+        }
+
+        const canConfirm =
+            !counting &&
+            eligible &&
+            scanningAllowed &&
+            multiPageCountingEnabled();
+
+        const confirmationToken = canConfirm
+            ? jwt.sign(
+                {
+                    purpose: "omr-combined-review",
+                    user_id: Number(req.user.id),
+                    ballot_id: first.ballot_id,
+                    reviews_hash: reviewsHash
+                },
+                pageReviewSecret(),
+                {
+                    algorithm: "HS256",
+                    audience: "campusvote-omr-combined",
+                    expiresIn: "5m"
+                }
+            )
+            : null;
+
+        return res.json({
+            success: true,
+            valid: eligible,
+            preview_only: !counting,
+            counted: counting,
+            can_confirm: canConfirm,
+            saved_votes: counting
+                ? combined.votes.length
+                : 0,
+
+            qr_version: "CV2",
+            election_id: first.election_id,
+            template_id: first.template_id,
+            ballot_id: first.ballot_id,
+            total_pages: pages.length,
+
+            status: counting
+                ? "COUNTED"
+                : ballot.status,
+
+            confirmation_token: confirmationToken,
+
+            positions: combined.positions.map(pos => ({
+                ...pos,
+                result:
+                    !counting && pos.result === "COUNTED"
+                        ? "VALID"
+                        : pos.result,
+
+                recorded: counting ? pos.recorded : 0
+            })),
+
+            valid_selections: combined.votes.length,
+
+            message: counting
+                ? "Ballot counted successfully."
+                : eligible
+                    ? "Combined review complete. No votes saved."
+                    : "No valid votes detected. No votes saved."
+        });
+
+    } catch (error) {
+        if (error.scopeDenied) {
+            return fail(403, error.message);
+        }
+
+        console.error(
+            "Multi-page operation failed:",
+            error.code || error.name
+        );
+
+        return res.status(500).json({
+            success: false,
+            counted: commitAttempted ? null : false,
+
+            message: commitAttempted
+                ? "Counting status unknown. Check Ballot Status."
+                : "Multi-page operation failed. No votes confirmed."
+        });
+
+    } finally {
+        if (db) {
+            try {
+                if (transactionStarted) {
+                    await db.rollback();
+                }
+
+                db.release();
+
+            } catch (_) {
+                db.destroy();
+            }
+        }
+    }
+}
+
+exports.validatePages = (req, res) =>
+    processCollectedPages(req, res, false);
+
+exports.countPages = (req, res) =>
+    processCollectedPages(req, res, true);
+
 
 /* LIVE TALLIES */
 

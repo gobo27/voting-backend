@@ -21,20 +21,56 @@ function errorResponse(res, label, error) {
     });
 }
 
-function validateCoordinates(coordinates) {
+
+function validateCoordinates(
+    coordinates,
+    totalPages = 1,
+    paperSize = "A5"
+) {
+    if (
+        !Number.isInteger(totalPages) ||
+        totalPages < 1 ||
+        totalPages > 100
+    ) {
+        return "Invalid total number of pages";
+    }
+
+    if (totalPages > 1 && paperSize !== "A4") {
+        return "Multi-page ballots must use A4";
+    }
+
     if (!Array.isArray(coordinates) || !coordinates.length) {
         return "At least one OMR coordinate is required";
     }
 
+    const paperWidth = Math.round(
+        (paperSize === "A4" ? 210 : 148.5) * 300 / 25.4
+    );
+
+    const paperHeight = Math.round(
+        (paperSize === "A4" ? 297 : 210) * 300 / 25.4
+    );
+
     const candidates = new Set();
     const codes = new Set();
+    const pages = new Set();
 
     for (const item of coordinates) {
+
+        if (!item) {
+            return "Invalid OMR coordinate data";
+        }
+
+        const page = item.page_number ??
+            (totalPages === 1 ? 1 : 0);
+
         if (
-            !item ||
             !validId(item.candidate_id) ||
             typeof item.bubble_code !== "string" ||
             !item.bubble_code.trim() ||
+            !Number.isInteger(page) ||
+            page < 1 ||
+            page > totalPages ||
             !Number.isInteger(item.x_pos) ||
             !Number.isInteger(item.y_pos) ||
             !Number.isInteger(item.width) ||
@@ -42,24 +78,35 @@ function validateCoordinates(coordinates) {
             item.x_pos < 0 ||
             item.y_pos < 0 ||
             item.width <= 0 ||
-            item.height <= 0
+            item.height <= 0 ||
+            item.x_pos + item.width > paperWidth ||
+            item.y_pos + item.height > paperHeight
         ) {
-            return "Invalid OMR coordinate data";
+            return "Invalid OMR coordinate or page";
         }
 
         const candidateId = Number(item.candidate_id);
         const code = item.bubble_code.trim();
 
-        if (candidates.has(candidateId) || codes.has(code)) {
+        if (
+            candidates.has(candidateId) ||
+            codes.has(code)
+        ) {
             return "Duplicate candidate or bubble code";
         }
 
         candidates.add(candidateId);
         codes.add(code);
+        pages.add(page);
+    }
+
+    if (pages.size !== totalPages) {
+        return "One or more ballot pages have no coordinates";
     }
 
     return null;
 }
+
 
 // ================= ELECTION LOCK =================
 
@@ -154,7 +201,7 @@ async function withCurrentElection(callback) {
         if (transactionStarted) {
             try {
                 await db.rollback();
-            } catch (_) {}
+            } catch (_) { }
         }
 
         throw error;
@@ -183,7 +230,7 @@ function matchesCurrent(requestedId, election) {
         (
             validId(requestedId) &&
             Number(requestedId) ===
-                Number(election.election_id)
+            Number(election.election_id)
         )
     );
 }
@@ -257,8 +304,8 @@ exports.createTemplate = async (req, res) => {
 
                 const [insert] = await db.execute(
                     `INSERT INTO ballot_templates
-                     (election_id, template_name, paper_size)
-                     VALUES (?, ?, ?)`,
+                    (election_id, template_name, paper_size, total_pages)
+                    VALUES (?, ?, ?, 1)`,
                     [
                         election.election_id,
                         template_name.trim(),
@@ -294,11 +341,14 @@ exports.createTemplate = async (req, res) => {
 
 // ================= CREATE COMPLETE OMR TEMPLATE =================
 
+
 exports.createCompleteTemplate = async (req, res) => {
+
     const {
         election_id,
         template_name,
         paper_size = "A5",
+        total_pages = 1,
         coordinates
     } = req.body || {};
 
@@ -310,13 +360,15 @@ exports.createCompleteTemplate = async (req, res) => {
         !validPaperSize(paper_size)
     ) {
         return res.status(400).json({
-            message:
-                "Invalid election, template name or paper size"
+            message: "Invalid election, template name or paper size"
         });
     }
 
-    const validationError =
-        validateCoordinates(coordinates);
+    const validationError = validateCoordinates(
+        coordinates,
+        total_pages,
+        paper_size
+    );
 
     if (validationError) {
         return res.status(400).json({
@@ -324,15 +376,26 @@ exports.createCompleteTemplate = async (req, res) => {
         });
     }
 
+    // Multi-page saving is for isolated testing only.
+    if (
+        total_pages > 1 &&
+        process.env.OMR_MULTIPAGE_TEMPLATE_TEST !== "true"
+    ) {
+        return res.status(409).json({
+            message: "Multi-page template saving is not yet enabled."
+        });
+    }
+
     try {
+
         const result = await withCurrentElection(
             async (db, election) => {
+
                 if (!matchesCurrent(election_id, election)) {
                     return {
                         status: 409,
                         body: {
-                            message:
-                                "Cannot create a ballot for an old election. Refresh the page."
+                            message: "Cannot create a ballot for an old election."
                         }
                     };
                 }
@@ -352,43 +415,74 @@ exports.createCompleteTemplate = async (req, res) => {
                     return {
                         status: 400,
                         body: {
-                            message:
-                                "Some candidates do not belong to the current election"
+                            message: "Invalid candidates for this election."
                         }
                     };
                 }
 
-                // Prevent identical complete templates.
-                const [existingTemplates] = await db.execute(
-                    `SELECT template_id
-                     FROM ballot_templates
-                     WHERE election_id = ?
-                       AND template_name = ?
-                       AND paper_size = ?
-                     ORDER BY template_id ASC`,
-                    [
-                        election.election_id,
-                        template_name.trim(),
-                        paper_size
-                    ]
-                );
+                // Require all candidates for multi-page templates.
+                if (total_pages > 1) {
 
-                const incoming = coordinates.map(c =>
-                    [
+                    const [[count]] = await db.execute(
+                        `SELECT COUNT(*) AS total
+                         FROM candidates c
+                         INNER JOIN positions p
+                           ON p.position_id = c.position_id
+                          AND p.election_id = c.election_id
+                         WHERE c.election_id = ?`,
+                        [election.election_id]
+                    );
+
+                    if (Number(count.total) !== candidateIds.length) {
+                        return {
+                            status: 400,
+                            body: {
+                                message: "The multi-page ballot must include all candidates."
+                            }
+                        };
+                    }
+                }
+
+                // Include page number in duplicate checking.
+                function signature(items) {
+
+                    return items.map(c => [
                         Number(c.candidate_id),
                         c.bubble_code.trim(),
-                        c.x_pos,
-                        c.y_pos,
-                        c.width,
-                        c.height
-                    ].join("|")
-                ).sort();
+                        Number(c.page_number ?? 1),
+                        Number(c.x_pos),
+                        Number(c.y_pos),
+                        Number(c.width),
+                        Number(c.height)
+                    ].join("|")).sort();
+                }
+
+                const incoming = signature(coordinates);
+
+                const [existingTemplates] =
+                    await db.execute(
+                        `SELECT template_id
+                         FROM ballot_templates
+                         WHERE election_id = ?
+                           AND template_name = ?
+                           AND paper_size = ?
+                           AND total_pages = ?
+                         ORDER BY template_id ASC`,
+                        [
+                            election.election_id,
+                            template_name.trim(),
+                            paper_size,
+                            total_pages
+                        ]
+                    );
 
                 for (const old of existingTemplates) {
+
                     const [oldCoords] = await db.execute(
                         `SELECT
                             candidate_id,
                             bubble_code,
+                            page_number,
                             x_pos,
                             y_pos,
                             width,
@@ -398,16 +492,7 @@ exports.createCompleteTemplate = async (req, res) => {
                         [old.template_id]
                     );
 
-                    const previous = oldCoords.map(c =>
-                        [
-                            Number(c.candidate_id),
-                            c.bubble_code.trim(),
-                            c.x_pos,
-                            c.y_pos,
-                            c.width,
-                            c.height
-                        ].join("|")
-                    ).sort();
+                    const previous = signature(oldCoords);
 
                     const identical =
                         previous.length === incoming.length &&
@@ -420,56 +505,79 @@ exports.createCompleteTemplate = async (req, res) => {
                         return {
                             status: 200,
                             body: {
-                                message:
-                                    "Identical ballot already saved",
+                                message: "Identical ballot already saved",
                                 duplicate: true,
                                 template: {
-                                    template_id:
-                                        old.template_id,
-                                    election_id:
-                                        election.election_id,
-                                    template_name:
-                                        template_name.trim(),
-                                    paper_size
+                                    template_id: old.template_id,
+                                    election_id: election.election_id,
+                                    template_name: template_name.trim(),
+                                    paper_size,
+                                    total_pages
                                 },
-                                coordinates_saved:
-                                    previous.length
+                                coordinates_saved: previous.length
                             }
                         };
                     }
                 }
 
-                // Create a new complete template.
+                // Save parent template.
                 const [insert] = await db.execute(
                     `INSERT INTO ballot_templates
-                     (election_id, template_name, paper_size)
-                     VALUES (?, ?, ?)`,
+                     (
+                        election_id,
+                        template_name,
+                        paper_size,
+                        total_pages
+                     )
+                     VALUES (?, ?, ?, ?)`,
                     [
                         election.election_id,
                         template_name.trim(),
-                        paper_size
+                        paper_size,
+                        total_pages
                     ]
                 );
 
                 const templateId = insert.insertId;
 
+                // Register each multi-page template page.
+                if (total_pages > 1) {
+
+                    for (
+                        let page = 1;
+                        page <= total_pages;
+                        page++
+                    ) {
+                        await db.execute(
+                            `INSERT INTO ballot_template_pages
+                             (template_id, page_number)
+                             VALUES (?, ?)`,
+                            [templateId, page]
+                        );
+                    }
+                }
+
+                // Save coordinates with page identification.
                 for (const item of coordinates) {
+
                     await db.execute(
                         `INSERT INTO omr_grid_coordinates
-                         (
+                        (
                             template_id,
                             candidate_id,
                             bubble_code,
+                            page_number,
                             x_pos,
                             y_pos,
                             width,
                             height
-                         )
-                         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                        )
+                        VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
                         [
                             templateId,
                             Number(item.candidate_id),
                             item.bubble_code.trim(),
+                            item.page_number ?? 1,
                             item.x_pos,
                             item.y_pos,
                             item.width,
@@ -481,17 +589,15 @@ exports.createCompleteTemplate = async (req, res) => {
                 return {
                     status: 201,
                     body: {
-                        message:
-                            "Complete OMR ballot saved successfully",
+                        message: "Complete OMR ballot saved successfully",
                         template: {
                             template_id: templateId,
                             election_id: election.election_id,
-                            template_name:
-                                template_name.trim(),
-                            paper_size
+                            template_name: template_name.trim(),
+                            paper_size,
+                            total_pages
                         },
-                        coordinates_saved:
-                            coordinates.length
+                        coordinates_saved: coordinates.length
                     }
                 };
             }
@@ -500,6 +606,7 @@ exports.createCompleteTemplate = async (req, res) => {
         return res.status(result.status).json(result.body);
 
     } catch (error) {
+
         return errorResponse(
             res,
             "Save complete ballot error:",
@@ -507,6 +614,7 @@ exports.createCompleteTemplate = async (req, res) => {
         );
     }
 };
+
 
 // ================= ADD SINGLE OMR COORDINATE =================
 
@@ -544,7 +652,7 @@ exports.addGridCoordinate = async (req, res) => {
         const result = await withCurrentElection(
             async (db, election) => {
                 const [templates] = await db.execute(
-                    `SELECT template_id, election_id
+                    `SELECT template_id, election_id, total_pages
                      FROM ballot_templates
                      WHERE template_id = ?
                      LIMIT 1`,
@@ -572,7 +680,15 @@ exports.addGridCoordinate = async (req, res) => {
                         }
                     };
                 }
-
+                if (Number(templates[0].total_pages) > 1) {
+                    return {
+                        status: 409,
+                        body: {
+                            message:
+                                "Multi-page templates must be saved as a complete template."
+                        }
+                    };
+                }
                 const validCandidates =
                     await candidatesBelongToElection(
                         db,
@@ -706,6 +822,7 @@ exports.getTemplate = async (req, res) => {
                 g.template_id,
                 g.candidate_id,
                 g.bubble_code,
+                g.page_number,
                 g.x_pos,
                 g.y_pos,
                 g.width,
@@ -722,7 +839,7 @@ exports.getTemplate = async (req, res) => {
                AND p.election_id = c.election_id
              WHERE g.template_id = ?
                AND c.election_id = ?
-             ORDER BY g.y_pos, g.x_pos`,
+             ORDER BY g.page_number, g.y_pos, g.x_pos`,
             [
                 Number(template_id),
                 electionId
@@ -780,9 +897,9 @@ exports.getTemplatesByElection = async (req, res) => {
 
         const [templates] = await connection.execute(
             `SELECT *
-             FROM ballot_templates
+        FROM ballot_templates
              WHERE election_id = ?
-             ORDER BY template_id DESC`,
+            ORDER BY template_id DESC`,
             [electionId]
         );
 
@@ -826,11 +943,11 @@ exports.deleteTemplate = async (req, res) => {
         const [templates] = await db.execute(
             `SELECT
                 template_id,
-                election_id,
-                template_name
+            election_id,
+            template_name
              FROM ballot_templates
              WHERE template_id = ?
-             LIMIT 1
+            LIMIT 1
              FOR UPDATE`,
             [templateId]
         );
@@ -850,12 +967,12 @@ exports.deleteTemplate = async (req, res) => {
         const [elections] = await db.execute(
             `SELECT
                 election_id,
-                is_current,
-                archived_at,
-                status
+            is_current,
+            archived_at,
+            status
              FROM elections
              WHERE election_id = ?
-             LIMIT 1`,
+            LIMIT 1`,
             [template.election_id]
         );
 
@@ -890,7 +1007,7 @@ exports.deleteTemplate = async (req, res) => {
             `SELECT batch_id
              FROM ballot_print_batches
              WHERE template_id = ?
-             LIMIT 1`,
+            LIMIT 1`,
             [templateId]
         );
 
@@ -909,7 +1026,7 @@ exports.deleteTemplate = async (req, res) => {
             `SELECT ballot_id
              FROM issued_ballots
              WHERE template_id = ?
-             LIMIT 1`,
+            LIMIT 1`,
             [templateId]
         );
 
@@ -926,7 +1043,12 @@ exports.deleteTemplate = async (req, res) => {
         // Delete saved OMR coordinates first.
         await db.execute(
             `DELETE FROM omr_grid_coordinates
-             WHERE template_id = ?`,
+             WHERE template_id = ? `,
+            [templateId]
+        );
+        await db.execute(
+            `DELETE FROM ballot_template_pages
+     WHERE template_id = ? `,
             [templateId]
         );
 
@@ -934,7 +1056,7 @@ exports.deleteTemplate = async (req, res) => {
         const [deleted] = await db.execute(
             `DELETE FROM ballot_templates
              WHERE template_id = ?
-               AND election_id = ?`,
+            AND election_id = ? `,
             [
                 templateId,
                 template.election_id
