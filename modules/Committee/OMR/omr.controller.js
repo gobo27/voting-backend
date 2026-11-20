@@ -3510,6 +3510,7 @@ exports.uploadAndProcess = async (req, res) => {
 
 
         if (counting) {
+            db = await pool.getConnection();
             await db.beginTransaction();
             transactionStarted = true;
 
