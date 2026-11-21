@@ -370,6 +370,7 @@ function canonicalPatch(image, H, coordinate, paper) {
     };
 }
 
+
 function measurement(patch, binary, coordinate) {
     let total = 0;
     let dark = 0;
@@ -386,11 +387,8 @@ function measurement(patch, binary, coordinate) {
                 (y - CENTER) / RADIUS
             );
 
-            /*
-             * SHADOW CHANGE:
-             * Use 70% of the oval radius.
-             * The printed outline remains outside the measurement mask.
-             */
+            // Measure inside the bubble,
+            // excluding the printed outline.
             if (radius > 0.70) continue;
 
             const index = y * PATCH_SIDE + x;
@@ -440,11 +438,7 @@ function measurement(patch, binary, coordinate) {
         );
     }
 
-    /*
-     * MAIN COUNTING CHANGE:
-     * Both normalized contrast and OpenCV coverage must agree.
-     * Ambiguous or poor-quality measurements become review results.
-     */
+    // Keep strict conditions for SHADED votes.
     const selected =
         quality.length === 0 &&
         average >= 34 &&
@@ -452,8 +446,24 @@ function measurement(patch, binary, coordinate) {
         adaptiveMarked >= 0.50 &&
         coreDark / core >= 0.30;
 
+    /*
+     * BLANK DETECTION FIX
+     *
+     * The original weak-contrast condition incorrectly
+     * identified some empty circles as UNCLEAR.
+     *
+     * Classify a clean, near-white bubble as BLANK.
+     * Poor-quality images must still require review.
+     */
+    const cleanBlank =
+        quality.length === 0 &&
+        average < 20 &&
+        marked < 0.08 &&
+        adaptiveMarked < 0.08;
+
     const unclear =
         !selected &&
+        !cleanBlank &&
         (
             quality.length > 0 ||
             (
@@ -474,20 +484,27 @@ function measurement(patch, binary, coordinate) {
         candidate_id: Number(coordinate.candidate_id),
         candidate_name: coordinate.candidate_name,
         position_id: Number(coordinate.position_id),
+
         selected,
         unclear,
+
         average,
         marked,
         baseline: patch.baseline,
+
         adaptive_dark_percent:
             Math.round(adaptiveMarked * 10000) / 100,
+
         adaptive_marked: adaptiveMarked,
         core_marked: coreDark / core,
         samples: total,
+
         projected_diameter:
             Math.round(patch.projectedDiameter * 100) / 100,
+
         background_residual:
             Math.round(patch.residual * 100) / 100,
+
         quality_reasons: quality
     };
 }
