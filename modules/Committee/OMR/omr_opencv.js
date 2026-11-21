@@ -208,6 +208,109 @@ function paperPlane(sectors) {
     return { plane, residual };
 }
 
+function locateBubbleCenter(image, H, coordinate) {
+    const x = Number(coordinate.x_pos);
+    const y = Number(coordinate.y_pos);
+    const w = Number(coordinate.width);
+    const h = Number(coordinate.height);
+
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+
+    const center = project(H, cx, cy);
+    const left = project(H, x, cy);
+    const right = project(H, x + w, cy);
+    const top = project(H, cx, y);
+    const bottom = project(H, cx, y + h);
+
+    if (![center, left, right, top, bottom].every(Boolean)) {
+        throw new Error("Invalid bubble projection.");
+    }
+
+    const diameter = Math.min(
+        Math.hypot(right.x - left.x, right.y - left.y),
+        Math.hypot(bottom.x - top.x, bottom.y - top.y)
+    );
+
+    const range = Math.min(
+        18,
+        Math.max(3, Math.round(diameter * 0.48))
+    );
+    const step = Math.max(1, Math.round(diameter / 16));
+    const ring = [];
+
+    for (let i = 0; i < 32; i++) {
+        const angle = i * 2 * Math.PI / 32;
+        const edge = project(
+            H,
+            cx + Math.cos(angle) * w / 2,
+            cy + Math.sin(angle) * h / 2
+        );
+
+        if (!edge) {
+            throw new Error("Invalid bubble outline.");
+        }
+
+        ring.push({
+            x: edge.x - center.x,
+            y: edge.y - center.y
+        });
+    }
+
+    let best = { dx: 0, dy: 0, score: -Infinity };
+
+    for (let dy = -range; dy <= range; dy += step) {
+        for (let dx = -range; dx <= range; dx += step) {
+            const differences = [];
+            let total = 0;
+            let valid = true;
+
+            for (const v of ring) {
+                const inner = sample(image, {
+                    x: center.x + dx + v.x * 0.96,
+                    y: center.y + dy + v.y * 0.96
+                });
+
+                const outer = sample(image, {
+                    x: center.x + dx + v.x * 1.25,
+                    y: center.y + dy + v.y * 1.25
+                });
+
+                if (inner === null || outer === null) {
+                    valid = false;
+                    break;
+                }
+
+                const difference = outer - inner;
+                differences.push(difference);
+
+                total += Math.max(
+                    -100,
+                    Math.min(200, difference)
+                );
+            }
+
+            if (!valid) continue;
+
+            differences.sort((a, b) => a - b);
+
+            const median =
+                (differences[15] + differences[16]) / 2;
+
+            const score =
+                0.4 * median +
+                0.6 * total / 32 -
+                0.07 * Math.hypot(dx, dy);
+
+            if (score > best.score) {
+                best = { dx, dy, score };
+            }
+        }
+    }
+
+    return best;
+}
+
 /*
  * HOMOGRAPHY CHANGE:
  * Sample a canonical patch through the same homography used by markers.
@@ -237,7 +340,16 @@ function canonicalPatch(image, H, coordinate, paper) {
 
     const cx = x + w / 2;
     const cy = y + h / 2;
+    const alignment = locateBubbleCenter(
+        image, H, coordinate
+    );
 
+    if (alignment.score < 20) {
+        throw new Error(
+            "Bubble outline alignment is uncertain. " +
+            "Retake a clear, well-lit ballot photo."
+        );
+    }
     const raw = new Float32Array(
         PATCH_SIDE * PATCH_SIDE
     );
@@ -258,14 +370,18 @@ function canonicalPatch(image, H, coordinate, paper) {
             const nx = (px - CENTER) / RADIUS;
             const ny = (py - CENTER) / RADIUS;
 
-            const value = sample(
-                image,
-                project(
-                    H,
-                    cx + nx * w / 2,
-                    cy + ny * h / 2
-                )
+            const sourcePoint = project(
+                H,
+                cx + nx * w / 2,
+                cy + ny * h / 2
             );
+
+            if (sourcePoint) {
+                sourcePoint.x += alignment.dx;
+                sourcePoint.y += alignment.dy;
+            }
+
+            const value = sample(image, sourcePoint);
 
             const index = py * PATCH_SIDE + px;
 
