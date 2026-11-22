@@ -76,4 +76,24 @@ router.get(
     qrController.getBatch
 );
 
+
+ // Department / grade ballot scopes
+router.get(
+    "/qr/scopes/election/:election_id",
+    qrController.getElectionScopes
+);
+
+// Confirm physical ballot printing
+router.post(
+    "/qr/batches/:batch_id/confirm-print",
+    verifyToken.requireRole("super_admin", "committee"),
+    qrController.confirmPrint
+);
+
+// Ballot Printing Monitor summary
+router.get(
+    "/qr/print-summary/election/:election_id",
+    qrController.getPrintSummary
+);
+
 module.exports = router;

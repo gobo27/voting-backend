@@ -976,14 +976,17 @@ exports.confirmPrint = async (req, res) => {
 exports.getPrintSummary = async (req, res) => {
     const electionId = Number(req.params.election_id);
 
-    if (!validId(electionId)) {
+    if (
+        !Number.isSafeInteger(electionId) ||
+        electionId <= 0
+    ) {
         return res.status(400).json({
             message: "Invalid election ID."
         });
     }
 
     try {
-        // Bilang ng unique registered QR ballots
+        // Total registered unique QR ballots.
         const [registered] = await pool.execute(
             `SELECT COUNT(*) AS count
              FROM issued_ballots
@@ -991,59 +994,106 @@ exports.getPrintSummary = async (req, res) => {
             [electionId]
         );
 
-        // Hiwalay ang Original at Additional gamit ang batch_type
-        const [printed] = await pool.execute(
+        // Get all operator-confirmed physical prints.
+        // Only ORIGINAL and REPRINT logs are included.
+        const [rows] = await pool.execute(
             `SELECT
-                COALESCE(SUM(
-                    CASE
-                        WHEN b.batch_type = 'ORIGINAL'
-                         AND l.print_type = 'ORIGINAL'
-                        THEN l.quantity
-                        ELSE 0
-                    END
-                ), 0) AS original,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN b.batch_type = 'ORIGINAL'
+                             AND l.print_type = 'ORIGINAL'
+                            THEN l.quantity
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS original,
 
-                COALESCE(SUM(
-                    CASE
-                        WHEN b.batch_type = 'ADDITIONAL'
-                         AND l.print_type = 'ORIGINAL'
-                        THEN l.quantity
-                        ELSE 0
-                    END
-                ), 0) AS additional
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN l.print_type = 'REPRINT'
+                            THEN l.quantity
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS reprints,
+
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN l.print_type IN (
+                                'ORIGINAL',
+                                'REPRINT'
+                            )
+                            THEN l.quantity
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS overall
 
              FROM ballot_print_logs l
+
              INNER JOIN ballot_print_batches b
                  ON b.batch_id = l.batch_id
+                AND b.election_id = l.election_id
+
              WHERE l.election_id = ?`,
             [electionId]
         );
 
-        const original = Number(printed[0].original);
-        const additional = Number(printed[0].additional);
+        const original = Number(
+            rows[0]?.original || 0
+        );
 
-        return res.json({
+        const reprints = Number(
+            rows[0]?.reprints || 0
+        );
+
+        const overall = Number(
+            rows[0]?.overall || 0
+        );
+
+        const registeredUnique = Number(
+            registered[0]?.count || 0
+        );
+
+        return res.status(200).json({
             election_id: electionId,
 
+            // Original printed ballots.
             initial_printed: original,
-            additional_printed: additional,
-
             original,
-            additional,
-            reprints: 0,
-            overall: original + additional,
 
-            registered_unique: Number(registered[0].count),
+            // Reprinted physical copies.
+            reprints,
+
+            // Total confirmed physical prints.
+            overall,
+
+            // Registered unique QR ballots.
+            registered_unique: registeredUnique,
 
             unit: "individual ballots (A4/A5)",
-            note: "Counts are operator-confirmed, not printer-verified."
+
+            note:
+                "Operator-confirmed physical prints. " +
+                "Reprints reuse existing registered QR IDs."
         });
 
     } catch (error) {
-        console.error("Print summary error:", error);
+        console.error(
+            "Print summary error:",
+            error
+        );
 
         return res.status(500).json({
             message: "Failed to load print summary."
         });
     }
 };
+
+
