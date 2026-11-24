@@ -296,23 +296,15 @@ exports.getPublicCandidates = async (req, res) => {
 
         const [rows] = await pool.execute(
             `SELECT
-                c.candidate_id,
-                c.name,
-                c.course,
-                c.grade_level,
-                c.party_list,
-                c.position_id,
-                c.display_order,
-                p.title AS position_title
-             FROM candidates c
-             JOIN positions p
-               ON p.position_id = c.position_id
-              AND p.election_id = c.election_id
-             WHERE c.election_id = ?
-             ORDER BY
-                p.display_order,
-                c.display_order,
-                c.candidate_id`,
+        ballot_id,
+        batch_id,
+        template_id,
+        ballot_number,
+        serial_number
+     FROM issued_ballots
+     WHERE election_id = ?
+       AND status = 'ISSUED'
+     ORDER BY ballot_number, ballot_id`,
             [election.election_id]
         );
 
@@ -554,8 +546,9 @@ exports.finishScanning = async (req, res) => {
                 }
 
                 if (
-                    isActive(election) &&
-                    scheduleState(election, phNow) !== "ENDED"
+                    !election.voting_closed_at ||
+                    isActive(election) ||
+                    votingOpen(election, phNow)
                 ) {
                     return {
                         status: 409,
@@ -795,7 +788,8 @@ exports.voidUnusedBallots = async (req, res) => {
 
                 if (
                     !scanningOpen(election) ||
-                    votingOpen(election, phNow)
+                    votingOpen(election, phNow) ||
+                    !election.voting_closed_at
                 ) {
                     return {
                         status: 409,
