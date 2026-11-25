@@ -356,6 +356,7 @@ exports.getAccounts = async (req, res) => {
              /* ADVISER ELECTION ASSIGNMENTS */
              LEFT JOIN election_adviser_assignments eaa
                 ON eaa.adviser_user_id = u.id
+                AND eaa.is_active = 1
 
              LEFT JOIN elections ae
                 ON ae.election_id = eaa.election_id

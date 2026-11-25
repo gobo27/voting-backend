@@ -406,6 +406,140 @@ exports.updateAssignments = async (req, res) => {
         if (conn) conn.release();
     }
 };
+// ASSIGN ADVISER TO CURRENT ELECTION
+exports.assignAdviser = async (req, res) => {
+    let conn;
+
+    try {
+        const adviserId = Number(req.params.id);
+        const electionId = Number(req.body?.election_id);
+        const assignedBy = Number(req.user?.id);
+
+        if (
+            !validId(adviserId) ||
+            !validId(electionId) ||
+            !validId(assignedBy)
+        ) {
+            return res.status(400).json({
+                message: "Invalid assignment details."
+            });
+        }
+
+        conn = await db.getConnection();
+        await conn.beginTransaction();
+
+        const [elections] = await conn.execute(
+            `SELECT election_id, title, status,
+                    is_current, archived_at,
+                    scanning_closed_at
+             FROM elections
+             WHERE election_id = ?
+             FOR UPDATE`,
+            [electionId]
+        );
+
+        const election = elections[0];
+
+        if (
+            !election ||
+            Number(election.is_current) !== 1 ||
+            election.archived_at
+        ) {
+            await conn.rollback();
+
+            return res.status(409).json({
+                message:
+                    "Advisers can only be assigned to the current unarchived election."
+            });
+        }
+
+        const [users] = await conn.execute(
+            `SELECT id, name, role
+             FROM users
+             WHERE id = ?
+             FOR UPDATE`,
+            [adviserId]
+        );
+
+        const adviser = users[0];
+
+        if (!adviser || adviser.role !== "adviser") {
+            await conn.rollback();
+
+            return res.status(400).json({
+                message: "Invalid Adviser account."
+            });
+        }
+
+        const [existing] = await conn.execute(
+            `SELECT assignment_id, is_active
+             FROM election_adviser_assignments
+             WHERE election_id = ?
+               AND adviser_user_id = ?
+             FOR UPDATE`,
+            [electionId, adviserId]
+        );
+
+        if (!existing.length) {
+
+            await conn.execute(
+                `INSERT INTO election_adviser_assignments
+                 (
+                     election_id,
+                     adviser_user_id,
+                     assigned_by,
+                     is_active,
+                     assigned_at
+                 )
+                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`,
+                [electionId, adviserId, assignedBy]
+            );
+
+        } else if (Number(existing[0].is_active) !== 1) {
+
+            await conn.execute(
+                `UPDATE election_adviser_assignments
+                 SET is_active = 1,
+                     assigned_by = ?,
+                     assigned_at = CURRENT_TIMESTAMP,
+                     revoked_at = NULL
+                 WHERE assignment_id = ?`,
+                [assignedBy, existing[0].assignment_id]
+            );
+        }
+
+        await conn.commit();
+
+        return res.json({
+            success: true,
+            message: "Adviser assigned successfully.",
+            election_id: electionId,
+            election_title: election.title,
+            adviser_user_id: adviserId,
+            post_election_assignment:
+                election.status === "completed"
+        });
+
+    } catch (error) {
+
+        if (conn) {
+            try {
+                await conn.rollback();
+            } catch (rollbackError) {
+                console.error(rollbackError);
+            }
+        }
+
+        console.error("ADVISER ASSIGNMENT ERROR:", error);
+
+        return res.status(500).json({
+            message: "Unable to assign Adviser."
+        });
+
+    } finally {
+        if (conn) conn.release();
+    }
+};
 
 // Reusable para sa Create/Edit Account integration
 exports.saveAssignments = saveAssignments;
