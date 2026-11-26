@@ -572,7 +572,7 @@ exports.createCompleteTemplate = async (req, res) => {
                             width,
                             height
                         )
-                        VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                         [
                             templateId,
                             Number(item.candidate_id),

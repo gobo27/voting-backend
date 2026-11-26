@@ -18,7 +18,6 @@ router.use(
     )
 );
 
-// BALLOT TEMPLATE ENDPOINTS
 
 // Create ballot template
 router.post(
