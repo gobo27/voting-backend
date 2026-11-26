@@ -3,7 +3,7 @@
 
 const connection = require("../../../config/db");
 
-// ================= HELPERS =================
+// HELPERS
 
 function validId(value) {
     const id = Number(value);
@@ -108,7 +108,7 @@ function validateCoordinates(
 }
 
 
-// ================= ELECTION LOCK =================
+// ELECTION LOCK
 
 async function withCurrentElection(callback) {
     const db = await connection.getConnection();
@@ -260,7 +260,7 @@ async function candidatesBelongToElection(
     return rows.length === candidateIds.length;
 }
 
-// ================= CREATE TEMPLATE =================
+// CREATE TEMPLATE
 
 exports.createTemplate = async (req, res) => {
     const {
@@ -339,7 +339,7 @@ exports.createTemplate = async (req, res) => {
     }
 };
 
-// ================= CREATE COMPLETE OMR TEMPLATE =================
+// CREATE COMPLETE OMR TEMPLATE
 
 
 exports.createCompleteTemplate = async (req, res) => {
@@ -541,24 +541,54 @@ exports.createCompleteTemplate = async (req, res) => {
                 const templateId = insert.insertId;
 
                 // Register each multi-page template page.
-                if (total_pages > 1) {
 
-                    for (
-                        let page = 1;
-                        page <= total_pages;
-                        page++
-                    ) {
-                        await db.execute(
-                            `INSERT INTO ballot_template_pages
-                             (template_id, page_number)
-                             VALUES (?, ?)`,
-                            [templateId, page]
-                        );
+                if (total_pages > 1) {
+                    const pagePlaceholders = Array.from(
+                        { length: total_pages },
+                        () => "(?, ?)"
+                    ).join(", ");
+
+                    const pageValues = [];
+
+                    for (let page = 1; page <= total_pages; page++) {
+                        pageValues.push(templateId, page);
                     }
+
+                    await db.execute(
+                        `INSERT INTO ballot_template_pages
+                        (template_id, page_number)
+                        VALUES ${pagePlaceholders}`,
+                        pageValues
+                    );
                 }
 
-                // Save coordinates with page identification.
-                for (const item of coordinates) {
+                // Save OMR coordinates using bulk insert.
+                const CHUNK_SIZE = 250;
+
+                for (
+                    let offset = 0;
+                    offset < coordinates.length;
+                    offset += CHUNK_SIZE
+                ) {
+                    const chunk = coordinates.slice(
+                        offset,
+                        offset + CHUNK_SIZE
+                    );
+
+                    const placeholders = chunk
+                        .map(() => "(?, ?, ?, ?, ?, ?, ?, ?)")
+                        .join(", ");
+
+                    const values = chunk.flatMap(item => [
+                        templateId,
+                        Number(item.candidate_id),
+                        item.bubble_code.trim(),
+                        item.page_number ?? 1,
+                        item.x_pos,
+                        item.y_pos,
+                        item.width,
+                        item.height
+                    ]);
 
                     await db.execute(
                         `INSERT INTO omr_grid_coordinates
@@ -572,17 +602,8 @@ exports.createCompleteTemplate = async (req, res) => {
                             width,
                             height
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [
-                            templateId,
-                            Number(item.candidate_id),
-                            item.bubble_code.trim(),
-                            item.page_number ?? 1,
-                            item.x_pos,
-                            item.y_pos,
-                            item.width,
-                            item.height
-                        ]
+                        VALUES ${placeholders}`,
+                        values
                     );
                 }
 
@@ -616,7 +637,7 @@ exports.createCompleteTemplate = async (req, res) => {
 };
 
 
-// ================= ADD SINGLE OMR COORDINATE =================
+// ADD SINGLE OMR COORDINATE
 
 exports.addGridCoordinate = async (req, res) => {
     const { template_id } = req.params;
@@ -788,7 +809,7 @@ exports.addGridCoordinate = async (req, res) => {
     }
 };
 
-// ================= GET ONE TEMPLATE =================
+// GET ONE TEMPLATE
 
 exports.getTemplate = async (req, res) => {
     const { template_id } = req.params;
@@ -860,7 +881,7 @@ exports.getTemplate = async (req, res) => {
     }
 };
 
-// ================= GET TEMPLATES BY ELECTION =================
+// GET TEMPLATES BY ELECTION
 
 exports.getTemplatesByElection = async (req, res) => {
     const { election_id } = req.params;
@@ -916,7 +937,7 @@ exports.getTemplatesByElection = async (req, res) => {
     }
 };
 
-// ================= DELETE UNUSED TEMPLATE =================
+// DELETE UNUSED TEMPLATE
 
 exports.deleteTemplate = async (req, res) => {
     const templateId = Number(req.params.template_id);
