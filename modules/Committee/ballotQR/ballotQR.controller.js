@@ -3,6 +3,7 @@
 
 const crypto = require("crypto");
 const QRCode = require("qrcode");
+
 const pool = require("../../../config/db");
 
 function validId(value) {
@@ -11,11 +12,18 @@ function validId(value) {
 }
 
 
+const MAX_MULTIPAGE_BATCH_PAGES = 1500;
+
 function multiPageTestEnabled() {
     return process.env.OMR_MULTIPAGE_QR_TEST === "true" &&
-        process.env.OMR_COUNTING_ENABLED === "false";
+        (
+            process.env.OMR_COUNTING_ENABLED === "false" ||
+            (
+                process.env.OMR_COUNTING_ENABLED === "true" &&
+                process.env.OMR_MULTIPAGE_COUNT_TEST === "true"
+            )
+        );
 }
-
 function qrPayload(ballot, page = null) {
     const parts = [
         page ? "CV2" : "CV1",
@@ -99,8 +107,13 @@ async function loadRegisteredBallots(db, batchId) {
         throw error;
     }
 
-    if (rows.length * total > 100) {
-        throw new Error("Multi-page test limit exceeded.");
+    if (rows.length * total > MAX_MULTIPAGE_BATCH_PAGES) {
+        const error = new Error(
+            "Multi-page batch exceeds the maximum page limit."
+        );
+
+        error.httpStatus = 409;
+        throw error;
     }
 
     // Retrieve existing page IDs.
@@ -390,18 +403,35 @@ exports.createBatch = async (req, res) => {
 
         if (totalPages > 1) {
 
+            if (!multiPageTestEnabled()) {
+                await db.rollback();
+                transactionOpen = false;
+
+                return res.status(409).json({
+                    message: "Multi-page QR generation is disabled."
+                });
+            }
+
+            if (template.paper_size !== "A4") {
+                await db.rollback();
+                transactionOpen = false;
+
+                return res.status(409).json({
+                    message: "Multi-page ballots must use A4 paper."
+                });
+            }
+
             if (
-                !multiPageTestEnabled() ||
-                template.paper_size !== "A4" ||
-                quantity * totalPages > 100
+                quantity * totalPages >
+                MAX_MULTIPAGE_BATCH_PAGES
             ) {
                 await db.rollback();
                 transactionOpen = false;
 
                 return res.status(409).json({
                     message:
-                        "Multi-page QR is restricted to " +
-                        "isolated testing (maximum 100 pages per batch)."
+                        `Maximum ${MAX_MULTIPAGE_BATCH_PAGES} ` +
+                        "printed pages per batch."
                 });
             }
 
@@ -544,66 +574,118 @@ exports.createBatch = async (req, res) => {
 
         const batchId = insert.insertId;
 
+
+        // Prepare registered ballots and pages.
+        const ballotRows = [];
+        const pageRows = [];
+
         for (let i = 0; i < quantity; i++) {
             const ballotId = crypto.randomUUID();
 
-            // Continue numbering across departments and grades.
-            const ballotNumber = lastBallotNumber + i + 1;
+            const ballotNumber =
+                lastBallotNumber + i + 1;
 
             const serialNumber =
                 `CV-${electionId}-` +
                 `${String(scope.scope_code).toUpperCase()}-` +
                 `${String(ballotNumber).padStart(5, "0")}`;
 
-            await db.execute(
-                `INSERT INTO issued_ballots
-            (
-                ballot_id,
-                batch_id,
-                election_id,
-                template_id,
-                scope_id,
-                serial_number,
-                ballot_number
-            )
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [
-                    ballotId,
-                    batchId,
-                    electionId,
-                    templateId,
-                    scopeId,
-                    serialNumber,
-                    ballotNumber
-                ]
-            );
+            ballotRows.push([
+                ballotId,
+                batchId,
+                electionId,
+                templateId,
+                scopeId,
+                serialNumber,
+                ballotNumber
+            ]);
 
             if (totalPages > 1) {
-
                 for (
                     let page = 1;
                     page <= totalPages;
                     page++
                 ) {
-
-                    await db.execute(
-                        `INSERT INTO issued_ballot_pages
-             (
-                page_id,
-                ballot_id,
-                page_number,
-                status
-             )
-             VALUES (?, ?, ?, 'PENDING')`,
-                        [
-                            crypto.randomUUID(),
-                            ballotId,
-                            page
-                        ]
-                    );
+                    pageRows.push([
+                        crypto.randomUUID(),
+                        ballotId,
+                        page
+                    ]);
                 }
             }
+        }
 
+        // Bulk insert registered ballots.
+        const CHUNK_SIZE = 250;
+
+        for (
+            let offset = 0;
+            offset < ballotRows.length;
+            offset += CHUNK_SIZE
+        ) {
+            const chunk = ballotRows.slice(
+                offset,
+                offset + CHUNK_SIZE
+            );
+
+            const placeholders = chunk
+                .map(() => "(?, ?, ?, ?, ?, ?, ?)")
+                .join(", ");
+
+            const [result] = await db.execute(
+                `INSERT INTO issued_ballots
+                (
+                    ballot_id,
+                    batch_id,
+                    election_id,
+                    template_id,
+                    scope_id,
+                    serial_number,
+                    ballot_number
+                )
+                VALUES ${placeholders}`,
+                chunk.flat()
+            );
+
+            if (result.affectedRows !== chunk.length) {
+                throw new Error(
+                    "Ballot registration mismatch."
+                );
+            }
+        }
+
+        // Bulk insert registered ballot pages.
+        for (
+            let offset = 0;
+            offset < pageRows.length;
+            offset += CHUNK_SIZE
+        ) {
+            const chunk = pageRows.slice(
+                offset,
+                offset + CHUNK_SIZE
+            );
+
+            const placeholders = chunk
+                .map(() => "(?, ?, ?, 'PENDING')")
+                .join(", ");
+
+            const [result] = await db.execute(
+                `INSERT INTO issued_ballot_pages
+                (
+                    page_id,
+                    ballot_id,
+                    page_number,
+                    status
+                )
+                VALUES ${placeholders}`,
+                chunk.flat()
+            );
+
+            if (result.affectedRows !== chunk.length) {
+                throw new Error(
+                    "Ballot page registration mismatch."
+                );
+            }
         }
 
         await db.commit();
